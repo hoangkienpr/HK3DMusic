@@ -459,12 +459,27 @@ object LibraryRepository {
     suspend fun searchYouTube(
         query: String,
         page: Int = 1,
+        sortBy: String? = null,
+        date: String? = null,
+        duration: String? = null,
+        features: String? = null,
         onResult: ((YouTubeResult) -> Unit)? = null
     ): List<YouTubeResult> = withContext(Dispatchers.IO) {
         runCatching {
+            fun okParam(v: String?, allowed: Set<String>) = v?.trim()?.takeIf { it in allowed }
+            val sb = okParam(sortBy, setOf("relevance", "rating", "upload_date", "view_count"))
+            val dt = okParam(date, setOf("hour", "today", "week", "month", "year"))
+            val du = okParam(duration, setOf("short", "long", "medium"))
+            val ft = okParam(features, setOf("hd", "subtitles", "creative_commons", "3d", "live", "4k", "360", "location", "hdr"))
+            val extra = buildString {
+                if (sb != null) append("&sort_by=").append(java.net.URLEncoder.encode(sb, "UTF-8"))
+                if (dt != null) append("&date=").append(java.net.URLEncoder.encode(dt, "UTF-8"))
+                if (du != null) append("&duration=").append(java.net.URLEncoder.encode(du, "UTF-8"))
+                if (ft != null) append("&features=").append(java.net.URLEncoder.encode(ft, "UTF-8"))
+            }
             val url = "$INVIDIOUS_INSTANCE/api/v1/search?q=" +
                 java.net.URLEncoder.encode(query, "UTF-8") +
-                "&type=video&page=$page"
+                "&type=video&page=$page$extra"
             val conn = URL(url).openConnection() as HttpURLConnection
             conn.setRequestProperty("User-Agent", "HK3DMusicPlayer/1.0")
             conn.connectTimeout = 10000
@@ -535,57 +550,81 @@ object LibraryRepository {
      */
     /** Pure helpers over a parsed /api/v1/videos response. */
 
-    private fun selectVideo(obj: JSONObject): Pair<String, Boolean>? {
+    private fun qualityHeight(label: String): Int = when (label.trim().lowercase()) {
+        "144p" -> 144
+        "240p" -> 240
+        "360p" -> 360
+        "480p" -> 480
+        "720p" -> 720
+        "1080p" -> 1080
+        "1440p" -> 1440
+        "2160p" -> 2160
+        else -> 0
+    }
+
+    private fun selectVideo(obj: JSONObject, preferred: String? = null): Pair<String, Boolean>? {
+        val pref = preferred?.trim()?.lowercase()?.takeIf { it.isNotBlank() && it != "auto" }
+        val maxH = when (pref) {
+            "144p" -> 144
+            "240p" -> 240
+            "360p" -> 360
+            "480p" -> 480
+            "720p" -> 720
+            "1080p" -> 1080
+            else -> Int.MAX_VALUE
+        }
+
         // 1) Muxed streams (video+audio together), if any exist at all.
         val muxed = obj.optJSONArray("formatStreams")
         if (muxed != null) {
             var bestUrl: String? = null
-            var bestRank = -1
+            var bestH = -1
+            var fallbackUrl: String? = null
+            var fallbackH = Int.MAX_VALUE
             for (i in 0 until muxed.length()) {
                 val fmt = muxed.getJSONObject(i)
                 val mimeType = fmt.optString("type", "")
                 if (!mimeType.startsWith("video/mp4")) continue
                 val streamUrl = fmt.optString("url", "")
                 if (streamUrl.isBlank()) continue
-                val rank = when (fmt.optString("qualityLabel")) {
-                    "720p" -> 4
-                    "480p" -> 3
-                    "360p" -> 2
-                    "1080p" -> 1
-                    else -> 0
-                }
-                if (rank > bestRank) {
-                    bestRank = rank
+                val h = qualityHeight(fmt.optString("qualityLabel"))
+                if (h <= 0) continue
+                if (h < fallbackH) { fallbackH = h; fallbackUrl = streamUrl }
+                if (h <= maxH && h > bestH) {
+                    bestH = h
                     bestUrl = streamUrl
                 }
             }
-            if (bestUrl != null) return bestUrl to true
+            val chosen = bestUrl ?: fallbackUrl
+            if (chosen != null) return chosen to true
         }
+
         // 2) Adaptive streams are video-only; prefer avc1 (H.264) for compatibility.
         val formats = obj.optJSONArray("adaptiveFormats") ?: return null
-        var best: Triple<String, Int, String>? = null
+        var best: Triple<String, Int, Int>? = null // url, height, avcBonus
+        var fallback: Triple<String, Int, Int>? = null
         for (i in 0 until formats.length()) {
             val fmt = formats.getJSONObject(i)
             val mimeType = fmt.optString("type", "")
             if (!mimeType.startsWith("video/mp4")) continue
             val streamUrl = fmt.optString("url", "")
             if (streamUrl.isBlank()) continue
-            val isAvc = mimeType.contains("avc1")
-            val q = fmt.optString("qualityLabel")
-            val rank = when (q) {
-                // Cap default at 480p: on weaker Wi-Fi/mobile connections
-                // 720p+ adaptive streams stall every few seconds.
-                "480p" -> if (isAvc) 8 else 4
-                "360p" -> if (isAvc) 7 else 3
-                "720p" -> if (isAvc) 6 else 2
-                "240p" -> if (isAvc) 5 else 1
-                "144p" -> if (isAvc) 2 else 0
-                "1080p" -> 0
-                else -> 0
+            val h = qualityHeight(fmt.optString("qualityLabel"))
+            if (h <= 0) continue
+            val avc = if (mimeType.contains("avc1")) 1 else 0
+            if (fallback == null || h < fallback!!.second || (h == fallback!!.second && avc > fallback!!.third)) {
+                fallback = Triple(streamUrl, h, avc)
             }
-            if (best == null || rank > best!!.second) best = Triple(streamUrl, rank, q)
+            // Default cap to 480p for adaptive to reduce stalling, unless user asked higher
+            val cap = if (pref == null) minOf(maxH, 480) else maxH
+            if (h <= cap) {
+                if (best == null || h > best!!.second || (h == best!!.second && avc > best!!.third)) {
+                    best = Triple(streamUrl, h, avc)
+                }
+            }
         }
-        return best?.let { it.first to false }
+        val chosen = best ?: fallback
+        return chosen?.let { it.first to false }
     }
 
     private fun selectAudio(obj: JSONObject, maxBitrateBps: Int?): AudioFormat? {
@@ -624,7 +663,7 @@ object LibraryRepository {
      * Single metadata round-trip: parses /api/v1/videos once and derives both
      * the video and audio selections (halves the previous two-fetch startup).
      */
-    private suspend fun fetchYouTubeStreams(videoId: String): YouTubeStreams? =
+    private suspend fun fetchYouTubeStreams(videoId: String, preferredQuality: String? = null): YouTubeStreams? =
         withContext(Dispatchers.IO) {
             runCatching {
                 val url = "$INVIDIOUS_INSTANCE/api/v1/videos/$videoId"
@@ -639,15 +678,15 @@ object LibraryRepository {
                 val json = conn.inputStream.bufferedReader().readText()
                 conn.disconnect()
                 val obj = JSONObject(json)
-                val video = selectVideo(obj)
+                val video = selectVideo(obj, preferredQuality)
                 val audio = if (video?.second == true) null else selectAudio(obj, null)?.url
                 YouTubeStreams(video?.first, video?.second ?: false, audio)
             }.getOrNull()
         }
 
     /** Returns a direct URL to a playable video stream for [videoId]. */
-    suspend fun getYouTubeVideoUrl(videoId: String): String? =
-        fetchYouTubeStreams(videoId)?.videoUrl
+    suspend fun getYouTubeVideoUrl(videoId: String, preferredQuality: String? = null): String? =
+        fetchYouTubeStreams(videoId, preferredQuality)?.videoUrl
 
     /** Everything the web remote needs to start a YouTube video on the phone. */
     data class YouTubeStreamInfo(
@@ -658,7 +697,7 @@ object LibraryRepository {
         val thumbUrl: String
     )
 
-    suspend fun getYouTubeStreamInfo(videoId: String): YouTubeStreamInfo? =
+    suspend fun getYouTubeStreamInfo(videoId: String, preferredQuality: String? = null): YouTubeStreamInfo? =
         withContext(Dispatchers.IO) {
             runCatching {
                 val url = "$INVIDIOUS_INSTANCE/api/v1/videos/$videoId"
@@ -673,13 +712,14 @@ object LibraryRepository {
                 val json = conn.inputStream.bufferedReader().readText()
                 conn.disconnect()
                 val obj = JSONObject(json)
-                val streams = fetchYouTubeStreams(videoId) ?: return@runCatching null
-                val video = streams.videoUrl ?: return@runCatching null
+                val videoSel = selectVideo(obj, preferredQuality)
+                val video = videoSel?.first ?: return@runCatching null
+                val audio = if (videoSel.second) null else selectAudio(obj, null)?.url
                 val thumb = obj.optJSONArray("videoThumbnails")?.optJSONObject(0)?.optString("url")
                     ?: "https://i.ytimg.com/vi/$videoId/mqdefault.jpg"
                 YouTubeStreamInfo(
                     videoUrl = video,
-                    audioUrl = streams.audioUrl,
+                    audioUrl = audio,
                     title = obj.optString("title", "YouTube"),
                     durationSec = obj.optInt("lengthSeconds", 0),
                     thumbUrl = thumb
@@ -691,8 +731,8 @@ object LibraryRepository {
      * Returns the (video, audio) stream URLs for [videoId]. When the instance
      * carries muxed streams, audio comes back null (already merged).
      */
-    suspend fun getYouTubeVideoAndAudioUrls(videoId: String): Pair<String, String?>? =
-        fetchYouTubeStreams(videoId)?.let { streams ->
+    suspend fun getYouTubeVideoAndAudioUrls(videoId: String, preferredQuality: String? = null): Pair<String, String?>? =
+        fetchYouTubeStreams(videoId, preferredQuality)?.let { streams ->
             val video = streams.videoUrl ?: return@let null
             video to streams.audioUrl
         }

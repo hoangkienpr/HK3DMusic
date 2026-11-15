@@ -332,6 +332,19 @@ fun MusicPlayerApp() {
     var podcastExpanded by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     var podcastDownloading by remember { mutableStateOf<String?>(null) }
     var podcastDownloaded by remember { mutableStateOf(prefs.getStringSet("podcast_downloaded", emptySet())?.toSet() ?: emptySet()) }
+    var podcastListened by remember { mutableStateOf(prefs.getStringSet("podcast_listened", emptySet())?.toSet() ?: emptySet()) }
+    var podcastProgress by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
+
+    LaunchedEffect(podcastFeeds, podcastListened, positionSeconds) {
+        val map = mutableMapOf<String, Int>()
+        podcastFeeds.forEach { f ->
+            f.episodes.forEach { ep ->
+                val pos = prefs.getInt("podcast_pos_${ep.guid}", 0)
+                if (pos > 0) map[ep.guid] = pos
+            }
+        }
+        podcastProgress = map
+    }
     LaunchedEffect(Unit) {
         val saved = prefs.getString("podcast_feeds", null) ?: return@LaunchedEffect
         val urls = runCatching { org.json.JSONArray(saved) }.getOrNull() ?: return@LaunchedEffect
@@ -380,7 +393,7 @@ fun MusicPlayerApp() {
     DisposableEffect(castManager) {
         onDispose { castManager.release() }
     }
-    val dlnaManager = remember { DlnaManager() }
+    val dlnaManager = remember { DlnaManager(context) }
     LaunchedEffect(Unit) { dlnaManager.startDiscovery() }
     DisposableEffect(dlnaManager) {
         onDispose { dlnaManager.release() }
@@ -597,6 +610,24 @@ fun MusicPlayerApp() {
                     }
 
                     is RemoteCommand.PlaySelection -> { val picked = command.indices.distinct().firstOrNull { it in songs.indices }; if (picked != null) { currentIndex = picked; isPlaying = true } }
+                    is RemoteCommand.QueueNext -> {
+                        val toAdd = command.indices.distinct().mapNotNull { songs.getOrNull(it) }
+                        if (toAdd.isNotEmpty() && songs.isNotEmpty()) {
+                            val insertAt = (currentIndex + 1).coerceIn(0, songs.size)
+                            songs = songs.toMutableList().apply { addAll(insertAt, toAdd) }
+                        } else if (toAdd.isNotEmpty()) {
+                            songs = songs + toAdd
+                            currentIndex = 0
+                        }
+                    }
+                    is RemoteCommand.QueueAdd -> {
+                        val toAdd = command.indices.distinct().mapNotNull { songs.getOrNull(it) }
+                        if (toAdd.isNotEmpty()) {
+                            val wasEmpty = songs.isEmpty()
+                            songs = songs + toAdd
+                            if (wasEmpty) currentIndex = 0
+                        }
+                    }
                     RemoteCommand.CastRescan -> { castManager.startDiscovery(); dlnaManager.startDiscovery() }
                     is RemoteCommand.CastConnect -> {
                         // Must run after `server` is ready: delegate through state.
@@ -758,7 +789,8 @@ fun MusicPlayerApp() {
                     .build()
             )
             .build()
-        controller?.setMediaItem(item)
+        val savedPos = prefs.getInt("podcast_pos_${episode.guid}", 0)
+        controller?.setMediaItem(item, if (savedPos > 5) savedPos * 1000L else 0L)
         controller?.prepare()
         controller?.play()
         isPlaying = true
@@ -997,9 +1029,9 @@ fun MusicPlayerApp() {
             youtubeHasMore = true
             youtubeLoading = true
             youtubeLoadingMore = false
-            val found = LibraryRepository.searchYouTube(searchQuery, 1) { r ->
+            val found = LibraryRepository.searchYouTube(searchQuery, 1, onResult = { r ->
                 Handler(Looper.getMainLooper()).post { youtubeResults = youtubeResults + r }
-            }
+            })
             youtubeLoading = false
             youtubeHasMore = found.isNotEmpty()
         } else if (!youtubeSearchMode) {
@@ -1035,9 +1067,9 @@ fun MusicPlayerApp() {
             youtubeLoadingMore = true
             val nextPage = youtubePage + 1
             scope.launch {
-                val found = LibraryRepository.searchYouTube(searchQuery, nextPage) { r ->
+                val found = LibraryRepository.searchYouTube(searchQuery, nextPage, onResult = { r ->
                     Handler(Looper.getMainLooper()).post { youtubeResults = youtubeResults + r }
-                }
+                })
                 youtubePage = nextPage
                 youtubeLoadingMore = false
                 if (found.isEmpty()) youtubeHasMore = false
@@ -1183,6 +1215,23 @@ fun MusicPlayerApp() {
             delay(500)
             isPlaying = p.isPlaying
             positionSeconds = (p.currentPosition / 1000L).toInt()
+            val mediaId = p.currentMediaItem?.mediaId.orEmpty()
+            if (mediaId.startsWith("podcast:")) {
+                val guid = mediaId.removePrefix("podcast:")
+                val dur = (p.duration / 1000L).coerceAtLeast(0L).toInt()
+                if (positionSeconds > 3) {
+                    prefs.edit().putInt("podcast_pos_$guid", positionSeconds).apply()
+                }
+                val ended = p.playbackState == Player.STATE_ENDED ||
+                    (dur > 30 && positionSeconds >= dur - 10)
+                if (ended && !podcastListened.contains(guid)) {
+                    podcastListened = podcastListened + guid
+                    prefs.edit()
+                        .putStringSet("podcast_listened", podcastListened)
+                        .remove("podcast_pos_$guid")
+                        .apply()
+                }
+            }
             if (p.playbackState == Player.STATE_ENDED) {
                 val endedId = songs.getOrNull(currentIndex)?.id
                 if (songs.isNotEmpty() && endedId != null && endedSongId != endedId) {
@@ -1348,6 +1397,7 @@ fun MusicPlayerApp() {
         // Video: full-screen player (also handles PiP with a bare surface).
         val activeVideo = fullscreenVideo
         if (activeVideo != null) {
+            val vIdx = videos.indexOfFirst { it.id == activeVideo.id }
             FullscreenVideoPlayer(
                 video = activeVideo,
                 pipMode = pipMode,
@@ -1368,7 +1418,9 @@ fun MusicPlayerApp() {
                     videoTitle = activeVideo.title
                 },
                 videoCommand = pendingVideoCommand,
-                onVideoCommandConsumed = { pendingVideoCommand = null }
+                onVideoCommandConsumed = { pendingVideoCommand = null },
+                onPreviousVideo = if (vIdx > 0) ({ openVideo(videos[vIdx - 1]) }) else null,
+                onNextVideo = if (vIdx >= 0 && vIdx < videos.lastIndex) ({ openVideo(videos[vIdx + 1]) }) else null
             )
             return@Box
         }
@@ -1806,6 +1858,8 @@ fun MusicPlayerApp() {
                         expanded = podcastExpanded,
                         downloadedGuids = podcastDownloaded,
                         downloadingGuid = podcastDownloading,
+                        listenedGuids = podcastListened,
+                        progressByGuid = podcastProgress,
                         onAddFeed = { addPodcastFeed(it) },
                         onRemoveFeed = { removePodcastFeed(it) },
                         onRefreshAll = { refreshPodcasts() },
@@ -2168,46 +2222,101 @@ fun MusicPlayerApp() {
                 exit = slideOutVertically(targetOffsetY = { fullHeight -> fullHeight }, animationSpec = tween(240, easing = FastOutSlowInEasing)) +
                     fadeOut(animationSpec = tween(180))
             ) {
-                MiniPlayer(
-                    song = displaySong,
-                    isPlaying = isPlaying,
-                    currentPositionSeconds = positionSeconds.coerceIn(0, totalSeconds),
-                    totalSeconds = totalSeconds,
-                    playbackSpeed = playbackSpeed,
-                    onPlayPauseToggle = {
-                        activeTogglePlayback()
-                    },
-                    onNext = {
-                        // Player queue only ever holds one item, so jump the library index directly
-                        val idx = songs.indexOfFirst { it.id == displaySong.id }
-                        if (idx >= 0) LibraryRepository.recordSkip(context, songs[idx].id)
-                        if (songs.isNotEmpty()) {
-                            currentIndex = (currentIndex + 1) % songs.size
-                            isPlaying = true
-                        }
-                    },
-                    onPrevious = {
-                        val idx = songs.indexOfFirst { it.id == displaySong.id }
-                        if (idx >= 0) LibraryRepository.recordSkip(context, songs[idx].id)
-                        if (songs.isNotEmpty()) {
-                            currentIndex = (currentIndex - 1 + songs.size) % songs.size
-                            isPlaying = true
-                        }
-                    },
-                    onSeek = { positionSeconds = it; resolveActivePlayer()?.seekTo(it * 1000L) },
-                    onSpeedChange = { playbackSpeed = it },
-                    onExpand = { activeTab = 0; showFullPlayer = true },
-                    localMuted = localMuted,
-                    onLocalMuteToggle = {
-                        localMuted = !localMuted
-                        controller?.volume = if (castActive || localMuted) 0f else volume
-                        Toast.makeText(
-                            context,
-                            if (localMuted) "Đã tắt tiếng máy" else "Đã bật lại tiếng máy",
-                            Toast.LENGTH_SHORT
-                        ).show()
+                val mediaId = controller?.currentMediaItem?.mediaId.orEmpty()
+                val podcastCtx = if (mediaId.startsWith("podcast:")) {
+                    val guid = mediaId.removePrefix("podcast:")
+                    podcastFeeds.firstNotNullOfOrNull { feed ->
+                        val idx = feed.episodes.indexOfFirst { it.guid == guid }
+                        if (idx >= 0) Triple(feed, feed.episodes[idx], idx) else null
                     }
-                )
+                } else null
+
+                if (podcastCtx != null) {
+                    val (feed, episode, epIdx) = podcastCtx
+                    val podSong = Song(
+                        id = episode.guid.hashCode().toLong(),
+                        title = episode.title,
+                        artist = feed.title,
+                        album = "Podcast",
+                        durationSeconds = episode.durationSec,
+                        genre = "Podcast",
+                        color1 = Color(0xFFFFB454),
+                        color2 = Color(0xFFFF7A59),
+                        audioUri = Uri.parse(episode.audioUrl)
+                    )
+                    MiniPlayer(
+                        song = podSong,
+                        isPlaying = isPlaying,
+                        currentPositionSeconds = positionSeconds.coerceIn(0, totalSeconds.coerceAtLeast(1)),
+                        totalSeconds = totalSeconds.coerceAtLeast(episode.durationSec).coerceAtLeast(1),
+                        playbackSpeed = playbackSpeed,
+                        onPlayPauseToggle = { activeTogglePlayback() },
+                        onNext = {
+                            val nextEp = feed.episodes.getOrNull(epIdx + 1)
+                            if (nextEp != null) playPodcastEpisode(feed, nextEp)
+                            else Toast.makeText(context, "Đã hết tập trong podcast này", Toast.LENGTH_SHORT).show()
+                        },
+                        onPrevious = {
+                            val prevEp = feed.episodes.getOrNull(epIdx - 1)
+                            if (prevEp != null) playPodcastEpisode(feed, prevEp)
+                            else Toast.makeText(context, "Đây là tập đầu tiên", Toast.LENGTH_SHORT).show()
+                        },
+                        onSeek = { positionSeconds = it; resolveActivePlayer()?.seekTo(it * 1000L) },
+                        onSpeedChange = { playbackSpeed = it },
+                        onExpand = { activeTab = 3 },
+                        localMuted = localMuted,
+                        onLocalMuteToggle = {
+                            localMuted = !localMuted
+                            controller?.volume = if (castActive || localMuted) 0f else volume
+                            Toast.makeText(
+                                context,
+                                if (localMuted) "Đã tắt tiếng máy" else "Đã bật lại tiếng máy",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    )
+                } else {
+                    MiniPlayer(
+                        song = displaySong,
+                        isPlaying = isPlaying,
+                        currentPositionSeconds = positionSeconds.coerceIn(0, totalSeconds),
+                        totalSeconds = totalSeconds,
+                        playbackSpeed = playbackSpeed,
+                        onPlayPauseToggle = {
+                            activeTogglePlayback()
+                        },
+                        onNext = {
+                            // Player queue only ever holds one item, so jump the library index directly
+                            val idx = songs.indexOfFirst { it.id == displaySong.id }
+                            if (idx >= 0) LibraryRepository.recordSkip(context, songs[idx].id)
+                            if (songs.isNotEmpty()) {
+                                currentIndex = (currentIndex + 1) % songs.size
+                                isPlaying = true
+                            }
+                        },
+                        onPrevious = {
+                            val idx = songs.indexOfFirst { it.id == displaySong.id }
+                            if (idx >= 0) LibraryRepository.recordSkip(context, songs[idx].id)
+                            if (songs.isNotEmpty()) {
+                                currentIndex = (currentIndex - 1 + songs.size) % songs.size
+                                isPlaying = true
+                            }
+                        },
+                        onSeek = { positionSeconds = it; resolveActivePlayer()?.seekTo(it * 1000L) },
+                        onSpeedChange = { playbackSpeed = it },
+                        onExpand = { activeTab = 0; showFullPlayer = true },
+                        localMuted = localMuted,
+                        onLocalMuteToggle = {
+                            localMuted = !localMuted
+                            controller?.volume = if (castActive || localMuted) 0f else volume
+                            Toast.makeText(
+                                context,
+                                if (localMuted) "Đã tắt tiếng máy" else "Đã bật lại tiếng máy",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    )
+                }
             }
 
         }

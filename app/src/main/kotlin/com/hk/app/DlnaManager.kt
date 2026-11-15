@@ -1,5 +1,7 @@
 package com.hk.app
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -33,7 +35,7 @@ data class CastTarget(
  * all we do is push `SetAVTransportURI` (with DIDL-Lite metadata) + `Play`,
  * then poll `GetTransportInfo` / `GetPositionInfo` to mirror the state in the UI.
  */
-class DlnaManager {
+class DlnaManager(private val context: Context? = null) {
 
     data class Device(
         val id: String,
@@ -90,6 +92,14 @@ class DlnaManager {
         if (scanning) return
         scanning = true
         Thread({
+            val lock = try {
+                val wifi = context?.applicationContext?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                wifi?.createMulticastLock("hk_dlna_ssdp")?.apply {
+                    setReferenceCounted(true)
+                    acquire()
+                }
+            } catch (_: Exception) { null }
+            try {
             val found = LinkedHashMap<String, Device>()
             val locations = LinkedHashSet<String>()
             runCatching {
@@ -141,7 +151,10 @@ class DlnaManager {
             if (merged.isNotEmpty()) {
                 devices = merged.values.sortedBy { it.name.lowercase(Locale.US) }
             }
-            scanning = false
+            } finally {
+                try { if (lock?.isHeld == true) lock.release() } catch (_: Exception) {}
+                scanning = false
+            }
         }, "dlna-ssdp").apply { isDaemon = true }.start()
     }
 

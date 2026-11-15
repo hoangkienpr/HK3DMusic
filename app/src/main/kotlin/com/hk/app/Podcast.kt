@@ -84,6 +84,8 @@ fun PodcastView(
     expanded: Map<String, Boolean>,
     downloadedGuids: Set<String>,
     downloadingGuid: String?,
+    listenedGuids: Set<String> = emptySet(),
+    progressByGuid: Map<String, Int> = emptyMap(),
     onAddFeed: (String) -> Unit,
     onRemoveFeed: (String) -> Unit,
     onRefreshAll: () -> Unit,
@@ -367,22 +369,33 @@ fun PodcastView(
                         feed.episodes.take(30).forEach { episode ->
                             val isDownloaded = episode.guid in downloadedGuids
                             val isDownloading = episode.guid == downloadingGuid
+                            val isListened = episode.guid in listenedGuids
+                            val savedPos = progressByGuid[episode.guid] ?: 0
+                            val hasProgress = !isListened && savedPos > 5
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(horizontal = 8.dp, vertical = 2.dp)
                                     .clip(RoundedCornerShape(12.dp))
-                                    .background(Color.White.copy(alpha = 0.03f))
+                                    .background(
+                                        if (isListened) Color.White.copy(alpha = 0.02f)
+                                        else Color.White.copy(alpha = 0.03f)
+                                    )
                                     .padding(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 IconButton(
                                     onClick = { onPlayEpisode(feed, episode) },
-                                    modifier = Modifier.size(38.dp).background(Color(0xFFFFB454), CircleShape)
+                                    modifier = Modifier
+                                        .size(38.dp)
+                                        .background(
+                                            if (isListened) Color(0xFF7CE38B).copy(alpha = 0.85f) else Color(0xFFFFB454),
+                                            CircleShape
+                                        )
                                 ) {
                                     Icon(
-                                        Icons.Filled.PlayArrow,
-                                        contentDescription = "Phát",
+                                        if (isListened) Icons.Filled.Check else Icons.Filled.PlayArrow,
+                                        contentDescription = if (isListened) "Nghe lại" else "Phát",
                                         tint = Color.Black,
                                         modifier = Modifier.size(22.dp)
                                     )
@@ -391,7 +404,7 @@ fun PodcastView(
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
                                         episode.title,
-                                        color = Color.White.copy(alpha = 0.9f),
+                                        color = Color.White.copy(alpha = if (isListened) 0.55f else 0.9f),
                                         fontSize = 12.sp,
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis,
@@ -400,10 +413,18 @@ fun PodcastView(
                                     val meta = buildList {
                                         if (episode.publishedMs > 0) add(dateFormat.format(Date(episode.publishedMs)))
                                         if (episode.durationSec > 0) add(formatTime(episode.durationSec))
+                                        if (isListened) add("Đã nghe")
+                                        else if (hasProgress) add("Dở ${formatTime(savedPos)}")
                                     }.joinToString(" · ")
                                     if (meta.isNotEmpty()) {
                                         Spacer(modifier = Modifier.height(2.dp))
-                                        Text(meta, color = Color.White.copy(alpha = 0.35f), fontSize = 10.sp)
+                                        Text(
+                                            meta,
+                                            color = if (isListened) Color(0xFF7CE38B).copy(alpha = 0.7f)
+                                            else if (hasProgress) Color(0xFFFFB454).copy(alpha = 0.8f)
+                                            else Color.White.copy(alpha = 0.35f),
+                                            fontSize = 10.sp
+                                        )
                                     }
                                 }
                                 IconButton(onClick = { onDownloadEpisode(feed, episode) }) {

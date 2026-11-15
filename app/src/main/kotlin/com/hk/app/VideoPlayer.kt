@@ -6,7 +6,15 @@ import android.content.pm.ActivityInfo
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitVerticalTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.verticalDrag
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.ui.input.pointer.positionChange
+import kotlin.math.abs
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,9 +40,19 @@ import androidx.compose.material.icons.filled.ScreenRotationAlt
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Text
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
@@ -50,6 +68,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.text.font.FontWeight
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
@@ -69,6 +88,7 @@ import kotlinx.coroutines.delay
  * - Side-strip gestures: left = brightness, right = volume
  * - ±10s skip buttons, manual PiP button, back to library
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FullscreenVideoPlayer(
     video: VideoItem,
@@ -79,7 +99,9 @@ fun FullscreenVideoPlayer(
     audioUri: android.net.Uri? = null,
     videoState: ((positionSeconds: Int, durationSeconds: Int, isPlaying: Boolean) -> Unit)? = null,
     videoCommand: String? = null,
-    onVideoCommandConsumed: () -> Unit = {}
+    onVideoCommandConsumed: () -> Unit = {},
+    onPreviousVideo: (() -> Unit)? = null,
+    onNextVideo: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val activity = context as? Activity
@@ -118,8 +140,22 @@ fun FullscreenVideoPlayer(
     // loop never touches a released player).
     val released = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
 
-    // Web remote: report the current playback state (position/duration/playing)
-    // so the browser page can render a "now playing" bar with seek controls.
+    // ---- Playback state for custom controls --------------------------------
+    var showControls by remember { mutableStateOf(true) }
+    var isPlayingState by remember { mutableStateOf(player.isPlaying) }
+    var positionMs by remember { mutableStateOf(player.currentPosition.coerceAtLeast(0L)) }
+    var durationMs by remember { mutableStateOf(player.duration.coerceAtLeast(0L)) }
+    var seeking by remember { mutableStateOf(false) }
+    var seekPosMs by remember { mutableStateOf(0L) }
+
+    LaunchedEffect(showControls, isPlayingState, seeking) {
+        if (showControls && isPlayingState && !seeking) {
+            delay(3500)
+            if (isPlayingState && !seeking) showControls = false
+        }
+    }
+
+    // Playback/UI state + web remote reporting
     LaunchedEffect(player) {
         while (!released.get()) {
             delay(500)
@@ -127,7 +163,13 @@ fun FullscreenVideoPlayer(
             runCatching {
                 val pos = (player.currentPosition / 1000L).toInt()
                 val dur = (player.duration.coerceAtLeast(0L) / 1000L).toInt()
-                videoState?.invoke(pos, dur, player.isPlaying)
+                val playing = player.isPlaying
+                isPlayingState = playing
+                if (!seeking) {
+                    positionMs = player.currentPosition.coerceAtLeast(0L)
+                    durationMs = player.duration.coerceAtLeast(0L)
+                }
+                videoState?.invoke(pos, dur, playing)
             }
         }
     }
@@ -215,6 +257,7 @@ fun FullscreenVideoPlayer(
 
     fun togglePlayPause() = if (player.isPlaying) player.pause() else player.play()
 
+
     // ---- Surface -----------------------------------------------------------
     if (pipMode) {
         // PiP: pure video surface, nothing else.
@@ -237,7 +280,7 @@ fun FullscreenVideoPlayer(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
                 PlayerView(ctx).apply {
-                    useController = true
+                    useController = false
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                     this.player = player
                 }
@@ -245,17 +288,27 @@ fun FullscreenVideoPlayer(
             update = { it.player = player }
         )
 
-        // Left strip: brightness
+        // Left strip: brightness (only consume vertical drags so taps reach player controls)
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .width(140.dp)
                 .align(Alignment.CenterStart)
                 .pointerInput(Unit) {
-                    detectVerticalDragGestures { change, dragAmount ->
-                        change.consume()
-                        val next = adjustBrightness(-dragAmount * 0.0022f)
-                        centerIndicator = Indicator(kind = IndicatorKind.Brightness, fraction = next)
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val drag = awaitVerticalTouchSlopOrCancellation(down.id) { change, _ ->
+                            change.consume()
+                        }
+                        if (drag != null) {
+                            val next0 = adjustBrightness(-drag.positionChange().y * 0.0022f)
+                            centerIndicator = Indicator(kind = IndicatorKind.Brightness, fraction = next0)
+                            verticalDrag(drag.id) { change ->
+                                change.consume()
+                                val next = adjustBrightness(-change.positionChange().y * 0.0022f)
+                                centerIndicator = Indicator(kind = IndicatorKind.Brightness, fraction = next)
+                            }
+                        }
                     }
                 }
         )
@@ -266,10 +319,20 @@ fun FullscreenVideoPlayer(
                 .width(140.dp)
                 .align(Alignment.CenterEnd)
                 .pointerInput(Unit) {
-                    detectVerticalDragGestures { change, dragAmount ->
-                        change.consume()
-                        val next = adjustVolume(-dragAmount * 0.004f)
-                        centerIndicator = Indicator(kind = IndicatorKind.Volume, fraction = next)
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val drag = awaitVerticalTouchSlopOrCancellation(down.id) { change, _ ->
+                            change.consume()
+                        }
+                        if (drag != null) {
+                            val next0 = adjustVolume(-drag.positionChange().y * 0.004f)
+                            centerIndicator = Indicator(kind = IndicatorKind.Volume, fraction = next0)
+                            verticalDrag(drag.id) { change ->
+                                change.consume()
+                                val next = adjustVolume(-change.positionChange().y * 0.004f)
+                                centerIndicator = Indicator(kind = IndicatorKind.Volume, fraction = next)
+                            }
+                        }
                     }
                 }
         )
@@ -407,9 +470,135 @@ fun FullscreenVideoPlayer(
             }
         }
 
-        // The PlayerView handles tap-to-toggle its own controller.
+        // Tap center to show/hide controls
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(start = 140.dp, end = 140.dp, top = 90.dp, bottom = 140.dp)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) { showControls = !showControls }
+        )
+
+        // Bottom playback controls
+        AnimatedVisibility(
+            visible = showControls,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.BottomCenter)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = 0.6f))
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            ) {
+                val total = durationMs.coerceAtLeast(0L)
+                val current = (if (seeking) seekPosMs else positionMs).coerceIn(0L, total.coerceAtLeast(1L))
+                Slider(
+                    value = if (total > 0L) current.toFloat() else 0f,
+                    onValueChange = { v ->
+                        seeking = true
+                        seekPosMs = v.toLong()
+                    },
+                    onValueChangeFinished = {
+                        val target = seekPosMs.coerceIn(0L, (player.duration.coerceAtLeast(0L)))
+                        player.seekTo(target)
+                        positionMs = target
+                        seeking = false
+                        showControls = true
+                    },
+                    valueRange = 0f..(total.toFloat().coerceAtLeast(1f)),
+                    colors = SliderDefaults.colors(
+                        thumbColor = Color(0xFF00F2FE),
+                        activeTrackColor = Color(0xFF00F2FE),
+                        inactiveTrackColor = Color.White.copy(alpha = 0.25f)
+                    ),
+                    thumb = {
+                        SliderDefaults.Thumb(
+                            interactionSource = remember { MutableInteractionSource() },
+                            thumbSize = androidx.compose.ui.unit.DpSize(10.dp, 10.dp),
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color(0xFF00F2FE),
+                                activeTrackColor = Color(0xFF00F2FE),
+                                inactiveTrackColor = Color.White.copy(alpha = 0.25f)
+                            )
+                        )
+                    },
+                    track = { sliderState ->
+                        SliderDefaults.Track(
+                            sliderState = sliderState,
+                            modifier = Modifier.height(3.dp),
+                            thumbTrackGapSize = 0.dp,
+                            drawStopIndicator = null
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth().height(20.dp)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = { onPreviousVideo?.invoke(); showControls = true },
+                            enabled = onPreviousVideo != null
+                        ) {
+                            Icon(
+                                Icons.Filled.SkipPrevious,
+                                contentDescription = "Video trước",
+                                tint = if (onPreviousVideo != null) Color.White else Color.White.copy(alpha = 0.3f),
+                                modifier = Modifier.size(30.dp)
+                            )
+                        }
+                        IconButton(onClick = {
+                            if (player.isPlaying) player.pause() else player.play()
+                            isPlayingState = player.isPlaying
+                            showControls = true
+                        }) {
+                            Icon(
+                                if (isPlayingState) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = if (isPlayingState) "Tạm dừng" else "Phát",
+                                tint = Color.White,
+                                modifier = Modifier.size(34.dp)
+                            )
+                        }
+                        IconButton(
+                            onClick = { onNextVideo?.invoke(); showControls = true },
+                            enabled = onNextVideo != null
+                        ) {
+                            Icon(
+                                Icons.Filled.SkipNext,
+                                contentDescription = "Video tiếp",
+                                tint = if (onNextVideo != null) Color.White else Color.White.copy(alpha = 0.3f),
+                                modifier = Modifier.size(30.dp)
+                            )
+                        }
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            formatVideoTimeMs(if (seeking) seekPosMs else positionMs) + " / " + formatVideoTimeMs(durationMs),
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Text(video.title, color = Color.White.copy(alpha = 0.65f), fontSize = 11.sp, maxLines = 1, modifier = Modifier.padding(start = 8.dp))
+                }
+            }
+        }
     }
 }
 
 private enum class IndicatorKind { Brightness, Volume }
 private data class Indicator(val kind: IndicatorKind, val fraction: Float)
+
+
+private fun formatVideoTimeMs(ms: Long): String {
+    val total = (ms / 1000L).coerceAtLeast(0L).toInt()
+    val h = total / 3600
+    val m = (total % 3600) / 60
+    val sec = total % 60
+    return if (h > 0) String.format("%d:%02d:%02d", h, m, sec) else String.format("%d:%02d", m, sec)
+}

@@ -89,6 +89,10 @@ data class Mute(val enabled: Boolean) : RemoteCommand
     data class RemoveQueue(val position: Int, val who: String? = null) : RemoteCommand
     /** Build a fresh queue (a temporary playlist) from library indices. */
     data class PlaySelection(val indices: List<Int>) : RemoteCommand
+    /** Insert library songs right after the currently playing item. */
+    data class QueueNext(val indices: List<Int>) : RemoteCommand
+    /** Append library songs to the end of the current queue. */
+    data class QueueAdd(val indices: List<Int>) : RemoteCommand
     /** Re-scan for Chromecast / Google TV devices. */
     data object CastRescan : RemoteCommand
     /** Select and connect to a discovered cast device (route id). */
@@ -228,6 +232,9 @@ class WebRemoteServer(
                 method == "GET" && path == "/api/status" ->
                     respondJson(output, statusJson())
 
+                method == "GET" && path == "/api/app-history" ->
+                    respondJson(output, appHistoryJson(query))
+
                 method == "GET" && path == "/api/lyrics" ->
                     respondJson(output, lyricsJson(query))
 
@@ -267,9 +274,16 @@ class WebRemoteServer(
 
                 method == "GET" && path == "/youtube/search" -> {
                     val q = query["q"].orEmpty()
+                    val page = (query["page"]?.toIntOrNull() ?: 1).coerceIn(1, 50)
+                    val sortBy = query["sort_by"]
+                    val date = query["date"]
+                    val duration = query["duration"]
+                    val features = query["features"]
                     val arr = JSONArray()
                     if (q.length >= 2) {
-                        val results = runBlocking { LibraryRepository.searchYouTube(q, 1) }
+                        val results = runBlocking {
+                            LibraryRepository.searchYouTube(q, page, sortBy, date, duration, features)
+                        }
                         results.forEach { r ->
                             arr.put(
                                 JSONObject()
@@ -281,14 +295,15 @@ class WebRemoteServer(
                             )
                         }
                     }
-                    respondJson(output, JSONObject().put("results", arr).toString())
+                    respondJson(output, JSONObject().put("results", arr).put("page", page).toString())
                 }
 
                 method == "GET" && path == "/youtube/stream" -> {
                     val id = query["videoId"].orEmpty()
+                    val quality = query["quality"]
                     var obj = JSONObject().put("url", JSONObject.NULL)
                     if (id.isNotBlank()) {
-                        val info = runBlocking { LibraryRepository.getYouTubeStreamInfo(id) }
+                        val info = runBlocking { LibraryRepository.getYouTubeStreamInfo(id, quality) }
                         if (info != null) {
                             obj = JSONObject()
                                 .put("url", info.videoUrl)
@@ -459,6 +474,32 @@ class WebRemoteServer(
                     return
                 }
                 onCommand(RemoteCommand.PlaySelection(indices))
+            }
+
+            "/queuenext" -> {
+                val indices = query["indices"].orEmpty()
+                    .split(',')
+                    .mapNotNull { it.trim().toIntOrNull() }
+                    .distinct()
+                if (indices.isEmpty()) {
+                    respondText(output, 400, "empty selection")
+                    return
+                }
+                onCommand(RemoteCommand.QueueNext(indices))
+                respondText(output, 200, "ok")
+            }
+
+            "/queueadd" -> {
+                val indices = query["indices"].orEmpty()
+                    .split(',')
+                    .mapNotNull { it.trim().toIntOrNull() }
+                    .distinct()
+                if (indices.isEmpty()) {
+                    respondText(output, 400, "empty selection")
+                    return
+                }
+                onCommand(RemoteCommand.QueueAdd(indices))
+                respondText(output, 200, "ok")
             }
             else -> {
                 respondText(output, 404, "unknown endpoint")
@@ -853,6 +894,41 @@ class WebRemoteServer(
     }
 
     /** Lyrics for one library index, with LRC timestamps when available. */
+    private fun appHistoryJson(query: Map<String, String>): String {
+        val state = stateProvider()
+        val limit = (query["limit"]?.toIntOrNull() ?: 30).coerceIn(1, 100)
+        val prefs = context.getSharedPreferences("listening_history", android.content.Context.MODE_PRIVATE)
+        val all = prefs.all
+        val byId = state.songs.associateBy { it.id }
+        data class Row(val song: Song, val lastPlayed: Long, val playCount: Int)
+        val rows = mutableListOf<Row>()
+        for ((k, v) in all) {
+            if (!k.startsWith("last_played_")) continue
+            val id = k.removePrefix("last_played_").toLongOrNull() ?: continue
+            val song = byId[id] ?: continue
+            val last = (v as? Long) ?: (v as? Number)?.toLong() ?: 0L
+            if (last <= 0L) continue
+            val count = prefs.getInt("play_count_$id", 0)
+            rows += Row(song, last, count)
+        }
+        rows.sortByDescending { it.lastPlayed }
+        val arr = org.json.JSONArray()
+        rows.take(limit).forEach { r ->
+            val idx = state.songs.indexOfFirst { it.id == r.song.id }
+            val o = org.json.JSONObject()
+                .put("id", r.song.id)
+                .put("index", idx)
+                .put("title", r.song.title)
+                .put("artist", r.song.artist)
+                .put("album", r.song.album)
+                .put("duration", r.song.durationSeconds)
+                .put("lastPlayed", r.lastPlayed)
+                .put("playCount", r.playCount)
+            arr.put(o)
+        }
+        return org.json.JSONObject().put("items", arr).toString()
+    }
+
     private fun lyricsJson(query: Map<String, String>): String {
         val index = query["index"]?.toIntOrNull() ?: -1
         val song = stateProvider().songs.getOrNull(index)
@@ -1317,7 +1393,7 @@ button.mini{width:auto;min-height:38px;border-radius:12px;font-size:12px;padding
           <div class="dashCard dashCardFill">
             <div class="dashHead">
               <div><div class="t"><span class="ico">🕘</span> Lịch sử phát</div><div class="sub" id="historySub">Phiên hiện tại · 0 mục</div></div>
-              <div class="actions"><button class="mini ghost" onclick="clearHistory()">🗑 Xoá tất cả</button></div>
+              <div class="actions"><button class="mini" id="histModeSession" onclick="setHistoryMode('session')">Phiên</button><button class="mini ghost" id="histModeApp" onclick="setHistoryMode('app')">Từ app</button><button class="mini ghost" onclick="clearHistory()">🗑 Xoá</button></div>
             </div>
             <div class="histList" id="historyList"><div class="empty">Chưa có lịch sử phát. Phát một bài để bắt đầu.</div></div>
             <div id="historyMore" style="display:none;padding:8px 12px;text-align:center;border-top:1px solid rgba(255,255,255,.06)"><button class="mini" onclick="showMoreHistory()">Xem thêm</button></div>
@@ -1446,27 +1522,29 @@ button.mini{width:auto;min-height:38px;border-radius:12px;font-size:12px;padding
       <div class="videoLayout">
         <div class="videoColList">
           <div class="row" style="margin-bottom:4px"><div class="label" style="margin:0">DANH SÁCH VIDEO (<span id="videoCount">0</span>)</div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="mini" onclick="playAllVideos()">▶ Phát tất cả</button><button class="mini" onclick="toggleVideoSearch()">🔍 Tìm YouTube</button></div></div>
-          <div id="youtubeSearchBox" style="display:none;margin-bottom:6px">
-            <div class="row"><input type="text" id="videoSearch" placeholder="Tìm video trên YouTube…" onkeydown="if(event.key==='Enter')searchVideoYoutube()" style="flex:1;padding:9px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:#fff;font-size:12px"><button class="mini" onclick="searchVideoYoutube()">Tìm</button></div>
-            <div id="videoYoutubeLoading" style="display:none;text-align:center;padding:10px;color:#ff8080;font-size:12px">Đang tải…</div>
+                    <div id="youtubeSearchBox" style="display:none;margin-bottom:6px">
+            <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
+              <input type="text" id="videoSearch" placeholder="Tìm video trên YouTube…" onkeydown="if(event.key==='Enter')searchVideoYoutube(true)" style="flex:1;min-width:180px;padding:9px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.3);color:#fff;font-size:12px">
+              <button class="mini" onclick="searchVideoYoutube(true)" style="border-color:#ff0844;color:#ff0844">🔍 Tìm</button>
+            </div>
+            <div class="row" style="flex-wrap:wrap;gap:6px;margin-top:6px;align-items:center">
+              <select id="ytSort" onchange="searchVideoYoutube(true)" style="padding:6px 8px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.35);color:#fff;font-size:11px"><option value="relevance">Liên quan</option><option value="upload_date">Mới đăng</option><option value="view_count">Lượt xem</option><option value="rating">Đánh giá</option></select>
+              <select id="ytDate" onchange="searchVideoYoutube(true)" style="padding:6px 8px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.35);color:#fff;font-size:11px"><option value="">Mọi thời gian</option><option value="hour">1 giờ</option><option value="today">Hôm nay</option><option value="week">Tuần</option><option value="month">Tháng</option><option value="year">Năm</option></select>
+              <select id="ytDuration" onchange="searchVideoYoutube(true)" style="padding:6px 8px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.35);color:#fff;font-size:11px"><option value="">Mọi độ dài</option><option value="short">Ngắn (&lt;4p)</option><option value="medium">Vừa (4-20p)</option><option value="long">Dài (&gt;20p)</option></select>
+              <select id="ytFeature" onchange="searchVideoYoutube(true)" style="padding:6px 8px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.35);color:#fff;font-size:11px"><option value="">Mọi loại</option><option value="hd">HD</option><option value="4k">4K</option><option value="subtitles">Phụ đề</option><option value="live">Trực tiếp</option></select>
+              <select id="ytQualityPref" onchange="saveYtQualityPref()" title="Chất lượng phát ưu tiên" style="padding:6px 8px;border-radius:8px;border:1px solid rgba(0,242,254,.25);background:rgba(0,0,0,.35);color:#fff;font-size:11px"><option value="auto">Chất lượng: Tự động</option><option value="360p">360p</option><option value="480p">480p</option><option value="720p">720p</option><option value="1080p">1080p</option></select>
+            </div>
+            <div id="ytHistoryWrap" style="margin-top:6px;display:none"><div class="muted" style="margin-bottom:4px">Tìm kiếm gần đây</div><div id="ytHistory" style="display:flex;flex-wrap:wrap;gap:6px"></div></div>
+            <div id="ytWatchWrap" style="margin-top:8px;display:none"><div class="row" style="margin-bottom:4px"><div class="muted">Đã xem gần đây</div><button class="mini ghost" onclick="clearYtWatchHistory()">Xoá</button></div><div id="ytWatchHistory" style="display:flex;flex-direction:column;gap:6px"></div></div>
+            <div id="videoYoutubeLoading" style="display:none;padding:8px;text-align:center"><span class="muted">Đang tải…</span></div>
             <div id="videoYoutubeResults"></div>
+            <div id="videoYoutubeMore" style="display:none;padding:8px;text-align:center"><button class="mini" onclick="loadMoreVideoYoutube()">Xem thêm kết quả</button></div>
           </div>
-          <div class="videoGrid" id="videoGrid"><div class="skelRow"></div><div class="skelRow"></div><div class="skelRow"></div></div>
-          <div id="videoEmpty" class="empty" style="display:none">Chưa có video trên máy. Hãy cấp quyền đọc video hoặc thêm tệp video.</div>
+
+          <div id="videoGrid" class="videoGrid"></div>
+          <div id="videoEmpty" class="empty" style="display:none">Chưa có video trong thư viện</div>
         </div>
         <div class="videoColPlayer">
-          <div id="webVideoWrap">
-            <div id="webVideoHead">
-              <div class="ttl" id="webVideoTitle">Đang phát</div>
-              <div class="vtools">
-                <select id="vSpeed" onchange="setVideoSpeed(this.value)" title="Tốc độ"><option value="0.5">0.5x</option><option value="0.75">0.75x</option><option value="1" selected>1x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2x</option></select>
-                <button class="mini" onclick="webVideoFs()">⛶ Toàn màn hình</button>
-                <button class="mini" onclick="closeWebVideo()">Đóng</button>
-              </div>
-            </div>
-            <video id="webVideo" controls playsinline preload="metadata"></video>
-          </div>
-          <div class="playerPlaceholder" id="videoPlaceholder"><span class="hint">Chọn một video từ danh sách để phát tại đây</span></div>
           <div class="videoNp" id="videoNp" style="display:none">
             <img class="vnpThumb" id="videoNpThumb" alt="">
             <div class="vnpBody">
@@ -1483,6 +1561,18 @@ button.mini{width:auto;min-height:38px;border-radius:12px;font-size:12px;padding
               <button class="vnpBtn" title="Chiếu TV" onclick="videoCastTv()">📺</button>
             </div>
           </div>
+          <div id="webVideoWrap">
+            <div id="webVideoHead">
+              <div class="ttl" id="webVideoTitle">Đang phát</div>
+              <div class="vtools">
+                <select id="vSpeed" onchange="setVideoSpeed(this.value)" title="Tốc độ"><option value="0.5">0.5x</option><option value="0.75">0.75x</option><option value="1" selected>1x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2x</option></select>
+                <button class="mini" onclick="webVideoFs()">⛶ Toàn màn hình</button>
+                <button class="mini" onclick="closeWebVideo()">Đóng</button>
+              </div>
+            </div>
+            <video id="webVideo" controls playsinline preload="metadata"></video>
+          </div>
+          <div class="playerPlaceholder" id="videoPlaceholder"><span class="hint">Chọn một video từ danh sách để phát tại đây</span></div>
         </div>
       </div>
     </div>
@@ -1511,11 +1601,16 @@ var eqCtx=null,eqLow=null,eqMid=null,eqHigh=null,eqGains=[0,0,0,0,0],eqName='Nor
 var playHistory=[];
 var _lastHistoryKey='';
 var historyLimit=20;
-function renderHistory(){var box=document.getElementById('historyList');if(!box)return;var sub=document.getElementById('historySub');if(sub)sub.textContent='Phiên hiện tại · '+playHistory.length+' mục';var hc=document.getElementById('dashHistCount');if(hc)hc.textContent=playHistory.length+' mục';if(!playHistory.length){box.innerHTML='<div class="empty">Chưa có lịch sử phát. Phát một bài để bắt đầu.</div>';var m=document.getElementById('historyMore');if(m)m.style.display='none';return;}var cur=(lastData&&typeof lastData.songIndex==='number')?lastData.songIndex:(lastData?lastData.currentIndex:-1);var show=playHistory.slice(0,historyLimit);var html='';for(var i=0;i<show.length;i++){var h=show[i];var playing=(h.songIndex===cur);var src=(h.source||'Local');html+='<div class="histItem'+(playing?' playing':'')+'" onclick="playSongIndex('+h.songIndex+')"><img src="/artwork?index='+h.songIndex+'" loading="lazy" alt=""><div class="meta"><div class="title">'+esc(h.title)+' <span class="srcBadge '+(src==='YouTube'?'yt':(src==='Upload'?'up':''))+'">'+esc(src)+'</span></div><div class="artist">'+esc(h.artist||'')+(h.album?(' · '+esc(h.album)):'')+'</div></div><div class="right"><span class="time">'+esc(h.time)+'</span><button class="hbtn" title="Xoá" onclick="event.stopPropagation();removeHistory('+i+')">✕</button></div></div>'; }box.innerHTML=html;var more=document.getElementById('historyMore');if(more)more.style.display=playHistory.length>historyLimit?'block':'none';}
+var historyMode='session';
+var appHistory=[];
+var appHistoryLoaded=false;
+function setHistoryMode(m){historyMode=m;var bs=document.getElementById('histModeSession');var ba=document.getElementById('histModeApp');if(bs){bs.classList.toggle('ghost',m!=='session');}if(ba){ba.classList.toggle('ghost',m!=='app');}if(m==='app')loadAppHistory(true); else renderHistory();}
+function loadAppHistory(force){if(appHistoryLoaded&&!force){renderHistory();return;}fetch('/api/app-history?limit=50',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){appHistory=(d&&d.items)?d.items:[];appHistoryLoaded=true;renderHistory();}).catch(function(){if(historyMode==='app'){var box=document.getElementById('historyList');if(box)box.innerHTML='<div class="empty">Không tải được lịch sử từ app</div>';}});}
+function renderHistory(){var box=document.getElementById('historyList');if(!box)return;var sub=document.getElementById('historySub');var hc=document.getElementById('dashHistCount');var list=(historyMode==='app')?appHistory:playHistory;var isApp=historyMode==='app';if(sub)sub.textContent=(isApp?'Từ app':'Phiên hiện tại')+' · '+list.length+' mục';if(hc)hc.textContent=list.length+' mục';if(!list.length){box.innerHTML='<div class="empty">'+(isApp?'Chưa có lịch sử nghe từ app.':'Chưa có lịch sử phát. Phát một bài để bắt đầu.')+'</div>';var m=document.getElementById('historyMore');if(m)m.style.display='none';return;}var cur=(lastData&&typeof lastData.songIndex==='number')?lastData.songIndex:(lastData?lastData.currentIndex:-1);var show=list.slice(0,historyLimit);var html='';for(var i=0;i<show.length;i++){var h=show[i];if(isApp){var idx=h.index;if(typeof idx!=='number')idx=-1;var playing=(idx===cur);var when=h.lastPlayed?new Date(h.lastPlayed).toLocaleString() : '';var cnt=h.playCount||0;html+='<div class="histItem'+(playing?' playing':'')+'" onclick="playSongIndex('+idx+')"><img src="/artwork?index='+idx+'" loading="lazy" alt=""><div class="meta"><div class="title">'+esc(h.title||'')+' <span class="srcBadge">App</span></div><div class="artist">'+esc(h.artist||'')+(h.album?(' · '+esc(h.album)):'')+(cnt?(' · '+cnt+' lần'):'')+'</div></div><div class="right"><span class="time">'+esc(when)+'</span></div></div>';}else{var playing2=(h.songIndex===cur);var src=(h.source||'Local');html+='<div class="histItem'+(playing2?' playing':'')+'" onclick="playSongIndex('+h.songIndex+')"><img src="/artwork?index='+h.songIndex+'" loading="lazy" alt=""><div class="meta"><div class="title">'+esc(h.title)+' <span class="srcBadge '+(src==='YouTube'?'yt':(src==='Upload'?'up':''))+'">'+esc(src)+'</span></div><div class="artist">'+esc(h.artist||'')+(h.album?(' · '+esc(h.album)):'')+'</div></div><div class="right"><span class="time">'+esc(h.time)+'</span><button class="hbtn" title="Xoá" onclick="event.stopPropagation();removeHistory('+i+')">✕</button></div></div>';}}box.innerHTML=html;var more=document.getElementById('historyMore');if(more)more.style.display=list.length>historyLimit?'block':'none';}
 function playSongIndex(idx){if(typeof idx==='number'&&idx>=0){fetch('/play?index='+idx,{cache:'no-store'}).then(function(){toast('Đang phát từ lịch sử','ok');poll();}).catch(function(){toast('Lỗi phát bài','err');});}}
 function trackHistory(d){if(!d||d.title==='No track')return;var idx=(d.songIndex>=0?d.songIndex:d.currentIndex);var simple=idx+':'+(d.title||''); if(simple===_lastHistoryKey)return; _lastHistoryKey=simple; var t=new Date(); var ts=('0'+t.getHours()).slice(-2)+':'+('0'+t.getMinutes()).slice(-2); var src=(d.youtubeUrl||d.album==='YouTube')?'YouTube':(d.album==='Web upload'?'Upload':'Local'); playHistory.unshift({songIndex:idx,title:d.title||'',artist:d.artist||'',album:d.album||'',source:src,time:ts}); if(playHistory.length>50)playHistory.length=50; historyLimit=20; renderHistory();}
 function removeHistory(i){playHistory.splice(i,1);renderHistory();}
-function clearHistory(){if(!playHistory.length)return;if(!confirm('Xoá toàn bộ lịch sử phát phiên này?'))return;playHistory=[];_lastHistoryKey='';renderHistory();toast('Đã xoá lịch sử','ok');}
+function clearHistory(){if(historyMode==='app'){toast('Lịch sử app không xoá từ web','err');return;}if(!playHistory.length)return;if(!confirm('Xoá toàn bộ lịch sử phát phiên này?'))return;playHistory=[];_lastHistoryKey='';renderHistory();toast('Đã xoá lịch sử phiên','ok');}
 function showMoreHistory(){historyLimit=Math.min(playHistory.length,historyLimit+20);renderHistory();}
 
 
@@ -1553,12 +1648,14 @@ function goToCurrent(){if(!lastData)return;switchTab('music');setTimeout(functio
 
 function chipFilter(el){document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active');});el.classList.add('active');musicFilter=el.getAttribute('data-f');renderList(lastData);}
 function filteredPlaylist(d){if(!d||!d.playlist)return[];var q=(document.getElementById('plSearch').value||'').toLowerCase();var items=d.playlist.slice();if(musicFilter==='yt')items=items.filter(function(s){return s.album==='YouTube';});else if(musicFilter==='upload')items=items.filter(function(s){return s.album==='Web upload';});else if(musicFilter==='local')items=items.filter(function(s){return s.album!=='YouTube'&&s.album!=='Web upload';});if(q)items=items.filter(function(s){return (s.title||'').toLowerCase().indexOf(q)>=0||(s.artist||'').toLowerCase().indexOf(q)>=0||(s.album||'').toLowerCase().indexOf(q)>=0||(sourceLabel(s)||'').toLowerCase().indexOf(q)>=0;});var sort=(document.getElementById('plSort')&&document.getElementById('plSort').value)||'queue';if(sort==='title')items.sort(function(a,b){return (a.title||'').localeCompare(b.title||'');});else if(sort==='artist')items.sort(function(a,b){return (a.artist||'').localeCompare(b.artist||'')||(a.title||'').localeCompare(b.title||'');});else if(sort==='duration')items.sort(function(a,b){return (a.duration||0)-(b.duration||0);});return items;}
-function renderList(d){var box=document.getElementById('list');if(!d||!d.playlist){box.innerHTML='<div class="empty">Chưa có dữ liệu</div>';return;}currentPlaylist=d.playlist;var items=filteredPlaylist(d);var c=document.getElementById('plCount');if(c)c.textContent=items.length+'/'+d.playlist.length+' bài';var key=items.map(function(s){return s.pos+':'+s.index;}).join('|');var mode=musicFilter+'|'+(document.getElementById('plSearch').value||'')+'|'+selectMode+'|'+items.length+'|'+((document.getElementById('plSort')&&document.getElementById('plSort').value)||'queue'); if(key===lastKey&&mode===lastKeyMode){var els=box.children;for(var i=0;i<els.length;i++){if(els[i].classList&&els[i].classList.contains('item')){var pos=parseInt(els[i].getAttribute('data-pos'),10);els[i].classList.toggle('active',pos===d.index);} }return;}lastKey=key;lastKeyMode=mode;if(!items.length){box.innerHTML='<div class="empty">Không có kết quả phù hợp</div>';return;}var html='';for(var i=0;i<items.length;i++){var s=items[i];var pos=(s.pos===undefined?i:s.pos);var checked=selected.has(s.index)?' checked':'';var src=(s.album==='YouTube')?'YouTube':(s.album==='Web upload'?'Upload':'');html+='<div class="item'+(pos===d.index?' active':'')+'" data-pos="'+pos+'" data-idx="'+s.index+'">'+(selectMode?('<input class="sel" type="checkbox"'+checked+' onclick="event.stopPropagation();toggleSel('+s.index+')">'):'')+'<span class="pos">'+(i+1)+'</span><span class="nm" onclick="playPos('+pos+',event)" title="'+esc(s.title)+'">'+esc(s.title)+(s.by?'<span class="by">'+esc(s.by)+'</span>':'')+(src?('<span class="srcBadge '+(src==='YouTube'?'yt':'up')+'">'+src+'</span>'):'')+'</span><span class="al">'+esc(s.album||'')+'</span><span class="dt">'+fmt(s.duration)+'</span><button class="castBtn" title="Chiếu lên TV" onclick="event.stopPropagation();castPlay('+s.index+')">📺</button><button class="del" title="Bỏ khỏi hàng đợi" onclick="event.stopPropagation();removeAt('+pos+')">✕</button></div>'; }box.innerHTML=html;}
+function renderList(d){var box=document.getElementById('list');if(!d||!d.playlist){box.innerHTML='<div class="empty">Chưa có dữ liệu</div>';return;}currentPlaylist=d.playlist;var items=filteredPlaylist(d);var c=document.getElementById('plCount');if(c)c.textContent=items.length+'/'+d.playlist.length+' bài';var key=items.map(function(s){return s.pos+':'+s.index;}).join('|');var mode=musicFilter+'|'+(document.getElementById('plSearch').value||'')+'|'+selectMode+'|'+items.length+'|'+((document.getElementById('plSort')&&document.getElementById('plSort').value)||'queue'); if(key===lastKey&&mode===lastKeyMode){var els=box.children;for(var i=0;i<els.length;i++){if(els[i].classList&&els[i].classList.contains('item')){var pos=parseInt(els[i].getAttribute('data-pos'),10);els[i].classList.toggle('active',pos===d.index);} }return;}lastKey=key;lastKeyMode=mode;if(!items.length){box.innerHTML='<div class="empty">Không có kết quả phù hợp</div>';return;}var html='';for(var i=0;i<items.length;i++){var s=items[i];var pos=(s.pos===undefined?i:s.pos);var checked=selected.has(s.index)?' checked':'';var src=(s.album==='YouTube')?'YouTube':(s.album==='Web upload'?'Upload':'');html+='<div class="item'+(pos===d.index?' active':'')+'" data-pos="'+pos+'" data-idx="'+s.index+'">'+(selectMode?('<input class="sel" type="checkbox"'+checked+' onclick="event.stopPropagation();toggleSel('+s.index+')">'):'')+'<span class="pos">'+(i+1)+'</span><span class="nm" onclick="playPos('+pos+',event)" title="'+esc(s.title)+'">'+esc(s.title)+(s.by?'<span class="by">'+esc(s.by)+'</span>':'')+(src?('<span class="srcBadge '+(src==='YouTube'?'yt':'up')+'">'+src+'</span>'):'')+'</span><span class="al">'+esc(s.album||'')+'</span><span class="dt">'+fmt(s.duration)+'</span><button class="del" title="Phát tiếp" onclick="event.stopPropagation();queueNextIndex('+s.index+')">⤴</button><button class="del" title="Thêm vào hàng đợi" onclick="event.stopPropagation();queueAddIndex('+s.index+')">＋</button><button class="castBtn" title="Chiếu lên TV" onclick="event.stopPropagation();castPlay('+s.index+')">📺</button><button class="del" title="Bỏ khỏi hàng đợi" onclick="event.stopPropagation();removeAt('+pos+')">✕</button></div>'; }box.innerHTML=html;}
 
 function playPos(p,ev){if(ev&&ev.shiftKey&&lastSelectedPos!==null){var a=Math.min(lastSelectedPos,p),b=Math.max(lastSelectedPos,p);for(var i=a;i<=b;i++){var item=currentPlaylist[i];if(item)selected.add(item.index);}lastSelectedPos=p;toast('Đã chọn vùng','ok');renderList(lastData);return;}lastSelectedPos=p;fetch('/playqueue?pos='+p,{cache:'no-store'}).then(poll).catch(function(){toast('Lỗi phát bài','err');});}
 function playAll(){if(lastData&&lastData.playlist&&lastData.playlist.length){playPos(0);toast('Phát tất cả','ok');}}
 function playShuffle(){if(lastData&&lastData.playlist&&lastData.playlist.length){var p=Math.floor(Math.random()*lastData.playlist.length);playPos(p);toast('Phát ngẫu nhiên','ok');}}
 function removeAt(p){if(!confirm('Bỏ bài này khỏi hàng đợi?'))return;fetch('/remove?pos='+p+whoParam(),{cache:'no-store'}).then(function(){toast('Đã xoá khỏi hàng đợi','ok');poll();}).catch(function(){toast('Không xoá được','err');});}
+function queueNextIndex(idx){fetch('/queuenext?indices='+idx,{cache:'no-store'}).then(function(){toast('Đã thêm vào phát tiếp','ok');poll();}).catch(function(){toast('Lỗi phát tiếp','err');});}
+function queueAddIndex(idx){fetch('/queueadd?indices='+idx,{cache:'no-store'}).then(function(){toast('Đã thêm vào hàng đợi','ok');poll();}).catch(function(){toast('Lỗi thêm hàng đợi','err');});}
 function whoParam(){var n=nickName();return n?('&who='+encodeURIComponent(n)):'';}
 function nickName(){var el=document.getElementById('nick');return el?(el.value||'').trim():'';}
 function saveNick(){try{localStorage.setItem('partyNick',nickName());}catch(e){}}
@@ -1595,9 +1692,25 @@ function videoSeekTo(v){fetch('/videoseek?pos='+v,{cache:'no-store'}).then(poll)
 function videoCastTv(){if(currentVideoIndex>=0)castVideoWeb(currentVideoIndex);else toast('Chưa có video đang phát trên điện thoại','err');}
 function playAllVideos(){if(lastData&&lastData.videos&&lastData.videos.length){playVideoWeb(0);}else toast('Không có video','err');}
 
-function toggleVideoSearch(){var box=document.getElementById('youtubeSearchBox');box.style.display=box.style.display==='none'?'block':'none';if(box.style.display==='block')document.getElementById('videoSearch').focus();}
-function searchVideoYoutube(){var q=document.getElementById('videoSearch').value.trim();if(q.length<2){toast('Nhập ít nhất 2 ký tự','err');return;}document.getElementById('videoYoutubeLoading').style.display='block';document.getElementById('videoYoutubeResults').innerHTML='';fetch('/youtube/search?q='+encodeURIComponent(q),{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){document.getElementById('videoYoutubeLoading').style.display='none';var res=d.results||[];if(!res.length){document.getElementById('videoYoutubeResults').innerHTML='<div class="empty">Không tìm thấy video</div>';return;}var html='';res.forEach(function(r){html+='<div class="ytItem"><img src="'+esc(r.thumbUrl)+'" loading="lazy" alt=""><div class="ytBody"><div class="ytTitle">'+esc(r.title)+'</div><div class="ytMeta">'+esc(r.author)+' · '+fmt(r.duration)+'</div><button class="ytBtn" onclick="playYoutubeVideo(\''+r.videoId+'\',this)">▶ Phát trên điện thoại</button></div></div>';});document.getElementById('videoYoutubeResults').innerHTML=html;toast('Tìm thấy '+res.length+' kết quả','ok');}).catch(function(){document.getElementById('videoYoutubeLoading').style.display='none';document.getElementById('videoYoutubeResults').innerHTML='<div class="empty">Lỗi tải kết quả</div>';toast('Lỗi tìm YouTube','err');});}
-function playYoutubeVideo(videoId,btn){if(btn)btn.disabled=true;document.getElementById('videoYoutubeLoading').style.display='block';fetch('/youtube/stream?videoId='+encodeURIComponent(videoId),{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){document.getElementById('videoYoutubeLoading').style.display='none';if(btn)btn.disabled=false;if(d&&d.url){fetch('/videoplay?url='+encodeURIComponent(d.url)+'&title='+encodeURIComponent(d.title||'YouTube')+'&audio='+encodeURIComponent(d.audioUrl||''),{cache:'no-store'}).then(function(){toast('Đang phát YouTube trên điện thoại','ok');poll();}).catch(function(){toast('Lỗi gửi lệnh phát','err');});}else{toast('Không lấy được luồng video','err');}}).catch(function(){document.getElementById('videoYoutubeLoading').style.display='none';if(btn)btn.disabled=false;toast('Lỗi tải luồng video','err');});}
+var ytSearchPage=1;var ytSearchQuery='';var ytSearchHasMore=false;var ytSearchResults=[];
+function ytGetQualityPref(){try{return localStorage.getItem('ytQualityPref')||'auto';}catch(e){return 'auto';}}
+function saveYtQualityPref(){var v=document.getElementById('ytQualityPref');if(v){try{localStorage.setItem('ytQualityPref',v.value);}catch(e){}}toast('Đã lưu chất lượng ưu tiên: '+(v?v.value:'auto'),'ok');}
+function loadYtQualityPref(){var v=document.getElementById('ytQualityPref');if(v)v.value=ytGetQualityPref();}
+function getYtSearchHistory(){try{return JSON.parse(localStorage.getItem('ytSearchHistory')||'[]')||[];}catch(e){return [];}}
+function addYtSearchHistory(q){q=(q||'').trim();if(!q)return;var h=getYtSearchHistory().filter(function(x){return x.toLowerCase()!==q.toLowerCase();});h.unshift(q);if(h.length>12)h=h.slice(0,12);try{localStorage.setItem('ytSearchHistory',JSON.stringify(h));}catch(e){}renderYtSearchHistory();}
+function renderYtSearchHistory(){var wrap=document.getElementById('ytHistoryWrap');var box=document.getElementById('ytHistory');if(!wrap||!box)return;var h=getYtSearchHistory();if(!h.length){wrap.style.display='none';box.innerHTML='';return;}wrap.style.display='block';var html='';h.forEach(function(q){html+='<button class="mini ghost" onclick="useYtHistory(\''+esc(q).replace(/'/g,'&#39;')+'\')">'+esc(q)+'</button>';});box.innerHTML=html;}
+function useYtHistory(q){var el=document.getElementById('videoSearch');if(el)el.value=q;searchVideoYoutube(true);}
+function getYtWatchHistory(){try{return JSON.parse(localStorage.getItem('ytWatchHistory')||'[]')||[];}catch(e){return [];}}
+function addYtWatchHistory(item){if(!item||!item.videoId)return;var h=getYtWatchHistory().filter(function(x){return x.videoId!==item.videoId;});h.unshift(item);if(h.length>20)h=h.slice(0,20);try{localStorage.setItem('ytWatchHistory',JSON.stringify(h));}catch(e){}renderYtWatchHistory();}
+function clearYtWatchHistory(){try{localStorage.removeItem('ytWatchHistory');}catch(e){}renderYtWatchHistory();toast('Đã xoá lịch sử xem','ok');}
+function renderYtWatchHistory(){var wrap=document.getElementById('ytWatchWrap');var box=document.getElementById('ytWatchHistory');if(!wrap||!box)return;var h=getYtWatchHistory();if(!h.length){wrap.style.display='none';box.innerHTML='';return;}wrap.style.display='block';var html='';h.slice(0,8).forEach(function(r){html+='<div class="ytItem" style="cursor:pointer" onclick="replayYtHistory(\''+esc(r.videoId)+'\')"><img src="'+esc(r.thumbUrl||'')+'" loading="lazy" alt=""><div class="ytBody"><div class="ytTitle">'+esc(r.title||'YouTube')+'</div><div class="ytMeta">'+esc(r.author||'')+' · '+fmt(r.duration||0)+'</div><button class="ytBtn" onclick="event.stopPropagation();replayYtHistory(\''+esc(r.videoId)+'\')">▶ Phát lại</button></div></div>';});box.innerHTML=html;}
+function replayYtHistory(videoId){playYoutubeVideo(videoId,null,null);}
+function toggleVideoSearch(){var box=document.getElementById('youtubeSearchBox');box.style.display=box.style.display==='none'?'block':'none';if(box.style.display==='block'){document.getElementById('videoSearch').focus();loadYtQualityPref();renderYtSearchHistory();renderYtWatchHistory();}}
+function ytFilterParams(){var p='';var sort=document.getElementById('ytSort');var date=document.getElementById('ytDate');var dur=document.getElementById('ytDuration');var feat=document.getElementById('ytFeature');if(sort&&sort.value)p+='&sort_by='+encodeURIComponent(sort.value);if(date&&date.value)p+='&date='+encodeURIComponent(date.value);if(dur&&dur.value)p+='&duration='+encodeURIComponent(dur.value);if(feat&&feat.value)p+='&features='+encodeURIComponent(feat.value);return p;}
+function renderYtSearchResults(){var box=document.getElementById('videoYoutubeResults');if(!box)return;if(!ytSearchResults.length){box.innerHTML='<div class="empty">Không tìm thấy video</div>';document.getElementById('videoYoutubeMore').style.display='none';return;}var html='';ytSearchResults.forEach(function(r,idx){html+='<div class="ytItem"><img src="'+esc(r.thumbUrl)+'" loading="lazy" alt=""><div class="ytBody"><div class="ytTitle">'+esc(r.title)+'</div><div class="ytMeta">'+esc(r.author)+' · '+fmt(r.duration)+'</div><button class="ytBtn" onclick="playYoutubeVideo(\''+r.videoId+'\',this,'+idx+')">▶ Phát trên điện thoại</button></div></div>';});box.innerHTML=html;document.getElementById('videoYoutubeMore').style.display=ytSearchHasMore?'block':'none';}
+function searchVideoYoutube(reset){var q=document.getElementById('videoSearch').value.trim();if(q.length<2){toast('Nhập ít nhất 2 ký tự','err');return;}if(reset!==false){ytSearchPage=1;ytSearchQuery=q;ytSearchResults=[];addYtSearchHistory(q);}document.getElementById('videoYoutubeLoading').style.display='block';if(ytSearchPage===1)document.getElementById('videoYoutubeResults').innerHTML='';fetch('/youtube/search?q='+encodeURIComponent(q)+'&page='+ytSearchPage+ytFilterParams(),{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){document.getElementById('videoYoutubeLoading').style.display='none';var res=d.results||[];if(ytSearchPage===1) ytSearchResults=res; else ytSearchResults=ytSearchResults.concat(res);ytSearchHasMore=res.length>0;renderYtSearchResults();if(ytSearchPage===1) toast('Tìm thấy '+res.length+' kết quả','ok');}).catch(function(){document.getElementById('videoYoutubeLoading').style.display='none';if(ytSearchPage===1)document.getElementById('videoYoutubeResults').innerHTML='<div class="empty">Lỗi tải kết quả</div>';toast('Lỗi tìm YouTube','err');});}
+function loadMoreVideoYoutube(){if(!ytSearchQuery)return;ytSearchPage++;searchVideoYoutube(false);}
+function playYoutubeVideo(videoId,btn,idx){if(btn)btn.disabled=true;document.getElementById('videoYoutubeLoading').style.display='block';var q='quality='+encodeURIComponent(ytGetQualityPref()||'auto');fetch('/youtube/stream?videoId='+encodeURIComponent(videoId)+'&'+q,{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){document.getElementById('videoYoutubeLoading').style.display='none';if(btn)btn.disabled=false;if(d&&d.url){var meta=(typeof idx==='number'&&ytSearchResults[idx])?ytSearchResults[idx]:{videoId:videoId,title:d.title||'YouTube',author:'',duration:d.duration||0,thumbUrl:d.thumbUrl||''};addYtWatchHistory({videoId:videoId,title:meta.title||d.title||'YouTube',author:meta.author||'',duration:meta.duration||d.duration||0,thumbUrl:meta.thumbUrl||d.thumbUrl||''});fetch('/videoplay?url='+encodeURIComponent(d.url)+'&title='+encodeURIComponent(d.title||'YouTube')+'&audio='+encodeURIComponent(d.audioUrl||''),{cache:'no-store'}).then(function(){toast('Đang phát YouTube trên điện thoại','ok');poll();}).catch(function(){toast('Lỗi gửi lệnh phát','err');});}else{toast('Không lấy được luồng video','err');}}).catch(function(){document.getElementById('videoYoutubeLoading').style.display='none';if(btn)btn.disabled=false;toast('Lỗi tải luồng video','err');});}
 
 function sourceLabel(d){if(d.youtubeUrl||d.album==='YouTube')return 'YouTube';if(d.album==='Web upload')return 'Upload';return 'Local';}
 function updateStatusExtra(d){var extra=[];if(d.shuffle)extra.push('Shuffle');if(d.repeat)extra.push('Repeat');if(d.party)extra.push('Party');if(d.isCasting)extra.push('Casting');document.getElementById('statusExtra').textContent=extra.join(' · ')||'Sẵn sàng';var b=document.getElementById('srcBadge');if(b){var s=sourceLabel(d);b.textContent=s;b.className='srcBadge'+(s==='YouTube'?' yt':(s==='Upload'?' up':''));}}
@@ -1644,6 +1757,7 @@ try{var sn=localStorage.getItem('partyNick');if(sn)document.getElementById('nick
 var _initTab=(location.hash||'').replace('#',''); if(!_initTab){try{_initTab=localStorage.getItem('hkTab')||'';}catch(e){}} if(['dashboard','music','video'].indexOf(_initTab)>=0) switchTab(_initTab,false);
 window.addEventListener('hashchange',function(){var h=(location.hash||'').replace('#',''); if(['dashboard','music','video'].indexOf(h)>=0) switchTab(h,false);});
 eqUpdateUI();
+loadAppHistory(false);
 setInterval(poll,1500);poll();
 </script>
 </body>
