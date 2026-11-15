@@ -78,11 +78,13 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    // Entering Picture-in-Picture through onUserLeaveHint trapped the activity in
-    // a zero-size invisible PiP surface on some devices. Keep manual PiP only —
-    // triggered by a direct button in Full Player.
+    // Auto-enter PiP for the video player when the user leaves the app.
+    // The flag is set by the Compose side while a video is fullscreen.
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
+        if (autoEnterPip && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            runCatching { enterPictureInPictureMode(buildPipParams(this, android.util.Rational(16, 9))) }
+        }
     }
 
     companion object {
@@ -94,14 +96,18 @@ class MainActivity : ComponentActivity() {
         const val PIP_TOGGLE = 2
         const val PIP_NEXT = 3
 
+        /** Set by the Compose side while the video player is fullscreen. */
+        @Volatile
+        var autoEnterPip: Boolean = false
+
         /** Compose side installs this handler; invoked on the main thread. */
         @Volatile
         var pipActionHandler: ((Int) -> Unit)? = null
 
         /** Picture-in-Picture params with aspect ratio, title and (API 31+) system action buttons. */
-        fun buildPipParams(context: Context): android.app.PictureInPictureParams {
+        fun buildPipParams(context: Context, aspect: android.util.Rational = android.util.Rational(1, 1)): android.app.PictureInPictureParams {
             val builder = android.app.PictureInPictureParams.Builder()
-                .setAspectRatio(android.util.Rational(1, 1))
+                .setAspectRatio(aspect)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 // System-level action buttons on the PiP window edge (Android 12+)

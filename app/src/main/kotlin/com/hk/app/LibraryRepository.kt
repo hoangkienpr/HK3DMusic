@@ -338,6 +338,26 @@ object LibraryRepository {
     fun youtubeDownloadDir(context: Context): File =
         File(context.filesDir, "youtube_music").apply { mkdirs() }
 
+    /**
+     * Evicts the oldest cached artwork once the cache grows past [maxFiles] or
+     * [maxBytes]. Downloads are the smallest assets we keep; music is untouched.
+     */
+    fun pruneArtworkCache(context: Context, maxFiles: Int = 300, maxBytes: Long = 30L * 1024 * 1024) {
+        val dir = artworkCacheDir(context)
+        val files = dir.listFiles()?.filter { it.isFile } ?: return
+        var remainingCount = files.size
+        var remainingBytes = files.sumOf { it.length() }
+        if (remainingCount <= maxFiles && remainingBytes <= maxBytes) return
+        for (file in files.sortedBy { it.lastModified() }) {
+            if (remainingCount <= maxFiles && remainingBytes <= maxBytes) break
+            val size = file.length()
+            if (runCatching { file.delete() }.isSuccess) {
+                remainingCount -= 1
+                remainingBytes -= size
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- Listening history & recommendations
 
     private val PREFS_NAME = "listening_history"
@@ -513,6 +533,170 @@ object LibraryRepository {
      * given, the highest format not exceeding the cap is chosen; otherwise the
      * bitrate-capped best format wins.
      */
+    /** Pure helpers over a parsed /api/v1/videos response. */
+
+    private fun selectVideo(obj: JSONObject): Pair<String, Boolean>? {
+        // 1) Muxed streams (video+audio together), if any exist at all.
+        val muxed = obj.optJSONArray("formatStreams")
+        if (muxed != null) {
+            var bestUrl: String? = null
+            var bestRank = -1
+            for (i in 0 until muxed.length()) {
+                val fmt = muxed.getJSONObject(i)
+                val mimeType = fmt.optString("type", "")
+                if (!mimeType.startsWith("video/mp4")) continue
+                val streamUrl = fmt.optString("url", "")
+                if (streamUrl.isBlank()) continue
+                val rank = when (fmt.optString("qualityLabel")) {
+                    "720p" -> 4
+                    "480p" -> 3
+                    "360p" -> 2
+                    "1080p" -> 1
+                    else -> 0
+                }
+                if (rank > bestRank) {
+                    bestRank = rank
+                    bestUrl = streamUrl
+                }
+            }
+            if (bestUrl != null) return bestUrl to true
+        }
+        // 2) Adaptive streams are video-only; prefer avc1 (H.264) for compatibility.
+        val formats = obj.optJSONArray("adaptiveFormats") ?: return null
+        var best: Triple<String, Int, String>? = null
+        for (i in 0 until formats.length()) {
+            val fmt = formats.getJSONObject(i)
+            val mimeType = fmt.optString("type", "")
+            if (!mimeType.startsWith("video/mp4")) continue
+            val streamUrl = fmt.optString("url", "")
+            if (streamUrl.isBlank()) continue
+            val isAvc = mimeType.contains("avc1")
+            val q = fmt.optString("qualityLabel")
+            val rank = when (q) {
+                // Cap default at 480p: on weaker Wi-Fi/mobile connections
+                // 720p+ adaptive streams stall every few seconds.
+                "480p" -> if (isAvc) 8 else 4
+                "360p" -> if (isAvc) 7 else 3
+                "720p" -> if (isAvc) 6 else 2
+                "240p" -> if (isAvc) 5 else 1
+                "144p" -> if (isAvc) 2 else 0
+                "1080p" -> 0
+                else -> 0
+            }
+            if (best == null || rank > best!!.second) best = Triple(streamUrl, rank, q)
+        }
+        return best?.let { it.first to false }
+    }
+
+    private fun selectAudio(obj: JSONObject, maxBitrateBps: Int?): AudioFormat? {
+        val formats = obj.optJSONArray("adaptiveFormats") ?: return null
+
+        var best: AudioFormat? = null
+        var bestUnder: AudioFormat? = null
+        for (i in 0 until formats.length()) {
+            val fmt = formats.getJSONObject(i)
+            val mimeType = fmt.optString("type", "")
+            if (!mimeType.startsWith("audio/")) continue
+            val streamUrl = fmt.optString("url", "")
+            if (streamUrl.isBlank()) continue
+            val bitrate = fmt.optInt("bitrate", 0)
+            val candidate = AudioFormat(streamUrl, bitrate, mimeType)
+            if (maxBitrateBps != null) {
+                if (bitrate in 1..maxBitrateBps) {
+                    if (best == null || bitrate > best!!.bitrate) best = candidate
+                } else if (bestUnder == null || bitrate < bestUnder!!.bitrate) {
+                    bestUnder = candidate
+                }
+            } else {
+                if (best == null || bitrate > best!!.bitrate) best = candidate
+            }
+        }
+        return best ?: bestUnder
+    }
+
+    private class YouTubeStreams(
+        val videoUrl: String?,
+        val isMuxed: Boolean,
+        val audioUrl: String?
+    )
+
+    /**
+     * Single metadata round-trip: parses /api/v1/videos once and derives both
+     * the video and audio selections (halves the previous two-fetch startup).
+     */
+    private suspend fun fetchYouTubeStreams(videoId: String): YouTubeStreams? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val url = "$INVIDIOUS_INSTANCE/api/v1/videos/$videoId"
+                val conn = URL(url).openConnection() as HttpURLConnection
+                conn.setRequestProperty("User-Agent", "HK3DMusicPlayer/1.0")
+                conn.connectTimeout = 10000
+                conn.readTimeout = 15000
+                if (conn.responseCode != 200) {
+                    conn.disconnect()
+                    return@runCatching null
+                }
+                val json = conn.inputStream.bufferedReader().readText()
+                conn.disconnect()
+                val obj = JSONObject(json)
+                val video = selectVideo(obj)
+                val audio = if (video?.second == true) null else selectAudio(obj, null)?.url
+                YouTubeStreams(video?.first, video?.second ?: false, audio)
+            }.getOrNull()
+        }
+
+    /** Returns a direct URL to a playable video stream for [videoId]. */
+    suspend fun getYouTubeVideoUrl(videoId: String): String? =
+        fetchYouTubeStreams(videoId)?.videoUrl
+
+    /** Everything the web remote needs to start a YouTube video on the phone. */
+    data class YouTubeStreamInfo(
+        val videoUrl: String,
+        val audioUrl: String?,
+        val title: String,
+        val durationSec: Int,
+        val thumbUrl: String
+    )
+
+    suspend fun getYouTubeStreamInfo(videoId: String): YouTubeStreamInfo? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val url = "$INVIDIOUS_INSTANCE/api/v1/videos/$videoId"
+                val conn = URL(url).openConnection() as HttpURLConnection
+                conn.setRequestProperty("User-Agent", "HK3DMusicPlayer/1.0")
+                conn.connectTimeout = 10000
+                conn.readTimeout = 15000
+                if (conn.responseCode != 200) {
+                    conn.disconnect()
+                    return@runCatching null
+                }
+                val json = conn.inputStream.bufferedReader().readText()
+                conn.disconnect()
+                val obj = JSONObject(json)
+                val streams = fetchYouTubeStreams(videoId) ?: return@runCatching null
+                val video = streams.videoUrl ?: return@runCatching null
+                val thumb = obj.optJSONArray("videoThumbnails")?.optJSONObject(0)?.optString("url")
+                    ?: "https://i.ytimg.com/vi/$videoId/mqdefault.jpg"
+                YouTubeStreamInfo(
+                    videoUrl = video,
+                    audioUrl = streams.audioUrl,
+                    title = obj.optString("title", "YouTube"),
+                    durationSec = obj.optInt("lengthSeconds", 0),
+                    thumbUrl = thumb
+                )
+            }.getOrNull()
+        }
+
+    /**
+     * Returns the (video, audio) stream URLs for [videoId]. When the instance
+     * carries muxed streams, audio comes back null (already merged).
+     */
+    suspend fun getYouTubeVideoAndAudioUrls(videoId: String): Pair<String, String?>? =
+        fetchYouTubeStreams(videoId)?.let { streams ->
+            val video = streams.videoUrl ?: return@let null
+            video to streams.audioUrl
+        }
+
     private suspend fun pickYouTubeAudioFormat(videoId: String, maxBitrateBps: Int?): AudioFormat? =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -531,27 +715,7 @@ object LibraryRepository {
                 conn.disconnect()
 
                 val obj = JSONObject(json)
-                val formats = obj.optJSONArray("adaptiveFormats") ?: return@runCatching null
-
-                val audioFormats = mutableListOf<AudioFormat>()
-                for (i in 0 until formats.length()) {
-                    val fmt = formats.getJSONObject(i)
-                    val mimeType = fmt.optString("type", "")
-                    if (mimeType.startsWith("audio/")) {
-                        val streamUrl = fmt.optString("url", "")
-                        val bitrate = fmt.optInt("bitrate", 0)
-                        if (streamUrl.isNotBlank()) {
-                            audioFormats.add(AudioFormat(streamUrl, bitrate, mimeType))
-                        }
-                    }
-                }
-                if (audioFormats.isEmpty()) return@runCatching null
-                if (maxBitrateBps == null) {
-                    audioFormats.maxByOrNull { it.bitrate }
-                } else {
-                    audioFormats.filter { it.bitrate in 1..maxBitrateBps }.maxByOrNull { it.bitrate }
-                        ?: audioFormats.minByOrNull { it.bitrate }
-                }
+                selectAudio(obj, maxBitrateBps)
             }.getOrNull()
         }
 

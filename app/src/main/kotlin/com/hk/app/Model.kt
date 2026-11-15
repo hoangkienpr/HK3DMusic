@@ -20,6 +20,21 @@ data class Song(
     val folderPath: String = "Music"
 )
 
+data class VideoItem(
+    val id: Long,
+    val title: String,
+    val durationMs: Long,
+    val sizeBytes: Long,
+    val width: Int,
+    val height: Int,
+    val folder: String,
+    val uri: Uri,
+    val dateAdded: Long = 0L,
+    val mimeType: String = "video/mp4"
+) {
+    val isPortrait: Boolean get() = height > width
+}
+
 data class LrcLine(val timeMs: Long, val text: String)
 
 private val LRC_TIME_TAG =

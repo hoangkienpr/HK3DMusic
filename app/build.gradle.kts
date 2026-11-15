@@ -12,8 +12,8 @@ android {
         applicationId = "com.hk.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 59
-        versionName = "1.58"
+        versionCode = 99
+        versionName = "1.98"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     testOptions {
@@ -95,6 +95,7 @@ dependencies {
     implementation("com.google.android.gms:play-services-cast-framework:21.3.0")
     implementation("com.google.zxing:core:3.5.3")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("io.coil-kt:coil-video:2.7.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.13")
     debugImplementation(libs.androidx.compose.ui.tooling)

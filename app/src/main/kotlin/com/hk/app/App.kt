@@ -45,10 +45,13 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -161,10 +164,15 @@ fun MusicPlayerApp() {
     val scope = rememberCoroutineScope()
 
     // ------------------------------------------------------- permissions
+    var videoReadGranted by remember { mutableStateOf(false) }
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { }
+    ) { grants ->
+        if (grants[Manifest.permission.READ_MEDIA_VIDEO] == true) videoReadGranted = true
+    }
     LaunchedEffect(Unit) {
+        videoReadGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VIDEO) ==
+            PackageManager.PERMISSION_GRANTED
         val needed = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             needed.add(Manifest.permission.READ_MEDIA_AUDIO)
@@ -175,6 +183,9 @@ fun MusicPlayerApp() {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             needed.add(Manifest.permission.ACCESS_COARSE_LOCATION)
         }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.READ_MEDIA_VIDEO)
+        }
         if (needed.isNotEmpty()) permissionLauncher.launch(needed.toTypedArray())
     }
 
@@ -183,12 +194,31 @@ fun MusicPlayerApp() {
     var libraryLoading by remember { mutableStateOf(false) }
     var libraryRefreshKey by remember { mutableIntStateOf(0) }
     var libraryReady by remember { mutableStateOf(false) }
+    var videos by remember { mutableStateOf<List<VideoItem>>(emptyList()) }
+    var videosLoading by remember { mutableStateOf(false) }
+    var fullscreenVideo by remember { mutableStateOf<VideoItem?>(null) }
+    // Web remote reads these for the "video now playing" bar and the video list.
+    var videoTitle by remember { mutableStateOf<String?>(null) }
+    var videoPlaying by remember { mutableStateOf(false) }
+    var videoPositionSeconds by remember { mutableIntStateOf(0) }
+    var videoDurationSeconds by remember { mutableIntStateOf(0) }
+    var videoIndex by remember { mutableIntStateOf(-1) }
+    var pendingVideoCommand by remember { mutableStateOf<String?>(null) }
+    var videoPlayIndexRequest by remember { mutableStateOf<Int?>(null) }
+    var videoUrlPlayRequest by remember { mutableStateOf<Triple<String, String, String?>?>(null) }
+    var videoNavRequest by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(libraryRefreshKey) {
+    LaunchedEffect(libraryRefreshKey, videoReadGranted) {
         libraryLoading = true
         songs = LibraryRepository.load(context)
+        withContext(Dispatchers.IO) { LibraryRepository.pruneArtworkCache(context) }
         libraryLoading = false
         libraryReady = true
+        if (videoReadGranted) {
+            videosLoading = true
+            videos = withContext(Dispatchers.IO) { VideoRepository.scan(context) }
+            videosLoading = false
+        }
     }
 
     DisposableEffect(Unit) {
@@ -200,6 +230,11 @@ fun MusicPlayerApp() {
         val registered = runCatching {
             context.contentResolver.registerContentObserver(
                 MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                true,
+                observer
+            )
+            context.contentResolver.registerContentObserver(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                 true,
                 observer
             )
@@ -289,6 +324,26 @@ fun MusicPlayerApp() {
     var vizMode by remember { mutableIntStateOf(prefs.getInt("vizMode", 0)) }
     // Concert Mode: full-screen audio-reactive light show for the current track.
     var concertMode by remember { mutableStateOf(false) }
+    var podcastFeeds by remember { mutableStateOf<List<PodcastFeed>>(emptyList()) }
+    var podcastLoading by remember { mutableStateOf(false) }
+    var podcastError by remember { mutableStateOf<String?>(null) }
+    var podcastMessage by remember { mutableStateOf<String?>(null) }
+    var podcastAddingUrl by remember { mutableStateOf<String?>(null) }
+    var podcastExpanded by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    var podcastDownloading by remember { mutableStateOf<String?>(null) }
+    var podcastDownloaded by remember { mutableStateOf(prefs.getStringSet("podcast_downloaded", emptySet())?.toSet() ?: emptySet()) }
+    LaunchedEffect(Unit) {
+        val saved = prefs.getString("podcast_feeds", null) ?: return@LaunchedEffect
+        val urls = runCatching { org.json.JSONArray(saved) }.getOrNull() ?: return@LaunchedEffect
+        podcastLoading = true
+        val loaded = mutableListOf<PodcastFeed>()
+        for (i in 0 until urls.length()) {
+            val url = urls.optString(i, "")
+            if (url.isNotBlank()) PodcastRepository.fetch(url)?.let { loaded += it }
+        }
+        podcastFeeds = loaded
+        podcastLoading = false
+    }
     LaunchedEffect(vizMode) { prefs.edit().putInt("vizMode", vizMode).apply() }
     var lyricOffsetMs by remember { mutableIntStateOf(prefs.getInt("lyricOffset", 0)) }
 
@@ -339,6 +394,14 @@ fun MusicPlayerApp() {
     var youtubeLoadingMore by remember { mutableStateOf(false) }
     var youtubePlayingSong by remember { mutableStateOf<Song?>(null) }
     var youtubePlayingVideoId by remember { mutableStateOf<String?>(null) }
+    // Video tab: search (local + YouTube) state
+    var videoSearchQuery by remember { mutableStateOf("") }
+    var videoYoutubeMode by remember { mutableStateOf(false) }
+    var videoYoutubeResults by remember { mutableStateOf<List<LibraryRepository.YouTubeResult>>(emptyList()) }
+    var videoYoutubeLoading by remember { mutableStateOf(false) }
+    var videoYoutubePage by remember { mutableIntStateOf(1) }
+    var videoYoutubeHasMore by remember { mutableStateOf(true) }
+    var videoYoutubeLoadingMore by remember { mutableStateOf(false) }
 
     // Lyrics (.lrc) import launcher, target song tracked in lyricImportSongId
     var lyricImportSongId by remember { mutableStateOf<Long?>(null) }
@@ -408,6 +471,7 @@ fun MusicPlayerApp() {
     // Pending web-remote cast requests, fulfilled after the server exists.
     var castConnectRequest by remember { mutableStateOf<CastTarget?>(null) }
     var castPlayIndexRequest by remember { mutableStateOf<Int?>(null) }
+    var castPlayVideoRequest by remember { mutableStateOf<Int?>(null) }
     // Device id the web asked for before it showed up in the discovered list.
     var pendingCastConnectId by remember { mutableStateOf<String?>(null) }
     // Track of the exact song we already handed to the TV. Re-running the push
@@ -448,6 +512,7 @@ fun MusicPlayerApp() {
                 }
                 RemoteState(
                     songs = songs,
+                    videos = videos,
                     currentIndex = currentIndex,
                     currentSong = youtubePlayingSong,
                     youtubeUrl = youtubePlayingSong?.audioUri?.toString(),
@@ -471,7 +536,13 @@ fun MusicPlayerApp() {
                     castDevices = liveCastTargets.map { CastDevice(it.id, if (it.isDlna) it.name + " (DLNA)" else it.name) },
                     isCasting = castManager.isCasting || dlnaManager.isCasting,
                     partyMode = partyMode,
-                    owners = songs.map { songOwners[it.id] }
+                    owners = songs.map { songOwners[it.id] },
+                    videoActive = fullscreenVideo != null,
+                    videoTitle = fullscreenVideo?.title ?: "",
+                    videoPlaying = videoPlaying,
+                    videoPosition = videoPositionSeconds,
+                    videoDuration = videoDurationSeconds,
+                    videoIndex = videoIndex
                 )
             },
             onCommand = { command ->
@@ -544,8 +615,43 @@ fun MusicPlayerApp() {
                         }
                     }
                     RemoteCommand.CastDisconnect -> { val p = resolveActivePlayer(); castManager.disconnect(); dlnaManager.disconnect(); castPushedKey = null; p?.pause() }
+                    is RemoteCommand.VideoPlayIndex -> {
+                        if (command.index in videos.indices) videoPlayIndexRequest = command.index
+                    }
+                    is RemoteCommand.VideoPlayUrl -> {
+                        videoUrlPlayRequest = Triple(command.url, command.title, command.audioUrl)
+                    }
+                    RemoteCommand.VideoToggle -> {
+                        if (fullscreenVideo != null && pendingVideoCommand == null) {
+                            pendingVideoCommand = "toggle"
+                        }
+                    }
+                    is RemoteCommand.VideoSeek -> {
+                        if (fullscreenVideo != null && pendingVideoCommand == null) {
+                            pendingVideoCommand = "seek:${command.seconds}"
+                        }
+                    }
+                    RemoteCommand.VideoSeekBack10 -> {
+                        if (fullscreenVideo != null && pendingVideoCommand == null) {
+                            pendingVideoCommand = "seek-10"
+                        }
+                    }
+                    RemoteCommand.VideoSeekFwd10 -> {
+                        if (fullscreenVideo != null && pendingVideoCommand == null) {
+                            pendingVideoCommand = "seek+10"
+                        }
+                    }
+                    RemoteCommand.VideoNext -> {
+                        videoNavRequest = "next"
+                    }
+                    RemoteCommand.VideoPrev -> {
+                        videoNavRequest = "prev"
+                    }
                     is RemoteCommand.CastPlayIndex -> {
                         if (command.index in songs.indices) castPlayIndexRequest = command.index
+                    }
+                    is RemoteCommand.CastPlayVideo -> {
+                        castPlayVideoRequest = command.index
                     }
                     }
                 }
@@ -582,6 +688,211 @@ fun MusicPlayerApp() {
                 serverError = "Chưa kết nối Wi-Fi"
             }
         }
+    }
+
+    fun savePodcastFeeds(list: List<PodcastFeed>) {
+        prefs.edit().putString(
+            "podcast_feeds",
+            org.json.JSONArray().apply { list.forEach { put(it.url) } }.toString()
+        ).apply()
+    }
+
+    fun addPodcastFeed(rawUrl: String) {
+        val url = rawUrl.trim()
+        if (url.isBlank()) return
+        scope.launch {
+            podcastLoading = true
+            podcastAddingUrl = url
+            podcastError = null
+            podcastMessage = "Đang thêm podcast..."
+            val feed = PodcastRepository.fetch(url)
+            if (feed == null) {
+                podcastError = "Không đọc được RSS — kiểm tra link hoặc mạng (hoặc link không còn hợp lệ)"
+                podcastMessage = null
+            } else {
+                val updated = (podcastFeeds + feed).distinctBy { it.url }
+                podcastFeeds = updated
+                savePodcastFeeds(updated)
+                podcastExpanded = podcastExpanded + (feed.url to true)
+                podcastMessage = "Đã thêm: ${feed.title}"
+            }
+            podcastLoading = false
+            podcastAddingUrl = null
+        }
+    }
+
+    fun removePodcastFeed(url: String) {
+        val updated = podcastFeeds.filterNot { it.url == url }
+        podcastFeeds = updated
+        podcastExpanded = podcastExpanded - url
+        savePodcastFeeds(updated)
+    }
+
+    fun refreshPodcasts() {
+        scope.launch {
+            podcastLoading = true
+            val loaded = mutableListOf<PodcastFeed>()
+            for (feed in podcastFeeds) {
+                PodcastRepository.fetch(feed.url)?.let { loaded += it }
+            }
+            if (loaded.isNotEmpty()) podcastFeeds = loaded
+            podcastLoading = false
+        }
+    }
+
+    fun togglePodcastExpand(url: String) {
+        podcastExpanded = podcastExpanded + (url to !(podcastExpanded[url] == true))
+    }
+
+    fun playPodcastEpisode(feed: PodcastFeed, episode: PodcastEpisode) {
+        val artwork = episode.artworkUrl ?: feed.artworkUrl
+        val item = MediaItem.Builder()
+            .setUri(episode.audioUrl)
+            .setMediaId("podcast:${episode.guid}")
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(episode.title)
+                    .setArtist(feed.title)
+                    .setAlbumTitle("Podcast")
+                    .apply { if (artwork != null) setArtworkUri(Uri.parse(artwork)) }
+                    .build()
+            )
+            .build()
+        controller?.setMediaItem(item)
+        controller?.prepare()
+        controller?.play()
+        isPlaying = true
+    }
+
+    fun downloadPodcastEpisode(feed: PodcastFeed, episode: PodcastEpisode) {
+        scope.launch {
+            podcastDownloading = episode.guid
+            val uri = PodcastRepository.download(context, episode)
+            if (uri != null) {
+                podcastDownloaded = podcastDownloaded + episode.guid
+                prefs.edit().putStringSet("podcast_downloaded", podcastDownloaded).apply()
+                Toast.makeText(
+                    context,
+                    "Đã tải — tập mới sẽ xuất hiện trong thư viện",
+                    Toast.LENGTH_SHORT
+                ).show()
+                libraryRefreshKey++
+            } else {
+                Toast.makeText(context, "Tải thất bại — kiểm tra mạng", Toast.LENGTH_SHORT).show()
+            }
+            podcastDownloading = null
+        }
+    }
+
+    // Open a video full-screen. The music service keeps running in background but
+    // is paused so the speakers belong to the player.
+    // Cast a library video (by index in `videos`) to the connected TV.
+    fun castVideo(index: Int) {
+        val v = videos.getOrNull(index) ?: return
+        val ip = localIpv4(context) ?: ""
+        if (ip.isEmpty()) {
+            Toast.makeText(context, "Chưa kết nối Wi-Fi", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!serverRunning) serverRunning = server.start()
+        if (!serverRunning) {
+            Toast.makeText(context, "Không bật được server phát video", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val url = "http://$ip:8080/video?index=$index"
+        val thumb = "http://$ip:8080/thumb?index=$index"
+        when {
+            dlnaManager.isCasting -> {
+                dlnaManager.playTrack(
+                    trackId = "video-${v.id}",
+                    url = url,
+                    title = v.title,
+                    artist = v.folder,
+                    album = "Video",
+                    artworkUrl = thumb
+                )
+            }
+            castManager.isCasting -> {
+                castManager.playToCast(url, v.title, v.mimeType)
+            }
+            else -> {
+                Toast.makeText(
+                    context,
+                    "Chưa kết nối TV — vào tab Share → Cast TV để kết nối",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    LaunchedEffect(castPlayVideoRequest) {
+        val index = castPlayVideoRequest ?: return@LaunchedEffect
+        castPlayVideoRequest = null
+        castVideo(index)
+    }
+
+    var fullscreenVideoAudioUri by remember { mutableStateOf<Uri?>(null) }
+
+    // Web remote reads these for the "video now playing" bar and the video list.
+    fun openVideo(item: VideoItem, audioUri: Uri? = null) {
+        controller?.pause()
+        isPlaying = false
+        fullscreenVideoAudioUri = audioUri
+        fullscreenVideo = item
+        videoIndex = videos.indexOfFirst { it.id == item.id }
+        videoDurationSeconds = (item.durationMs / 1000L).toInt().coerceAtLeast(0)
+        videoPlaying = true
+        videoPositionSeconds = 0
+        videoTitle = item.title
+        MainActivity.autoEnterPip = true
+    }
+
+    fun closeVideo() {
+        fullscreenVideo = null
+        fullscreenVideoAudioUri = null
+        videoTitle = null
+        videoPlaying = false
+        videoPositionSeconds = 0
+        videoDurationSeconds = 0
+        videoIndex = -1
+        MainActivity.autoEnterPip = false
+    }
+
+    LaunchedEffect(videoPlayIndexRequest) {
+        val index = videoPlayIndexRequest ?: return@LaunchedEffect
+        videoPlayIndexRequest = null
+        if (index in videos.indices) openVideo(videos[index])
+    }
+
+    LaunchedEffect(videoUrlPlayRequest) {
+        val req = videoUrlPlayRequest ?: return@LaunchedEffect
+        videoUrlPlayRequest = null
+        openVideo(
+            VideoItem(
+                id = req.first.hashCode().toLong(),
+                title = req.second,
+                durationMs = 0L,
+                sizeBytes = 0L,
+                width = 16,
+                height = 9,
+                folder = "YouTube",
+                uri = Uri.parse(req.first),
+                dateAdded = System.currentTimeMillis(),
+                mimeType = "video/mp4"
+            ),
+            audioUri = req.third?.let { Uri.parse(it) }
+        )
+    }
+
+    LaunchedEffect(videoNavRequest) {
+        val cmd = videoNavRequest ?: return@LaunchedEffect
+        videoNavRequest = null
+        val cur = fullscreenVideo ?: return@LaunchedEffect
+        val idx = videos.indexOfFirst { it.id == cur.id }
+        if (idx < 0 || videos.isEmpty()) return@LaunchedEffect
+        val next = if (cmd == "next") (idx + 1) % videos.size
+                   else (idx - 1 + videos.size) % videos.size
+        openVideo(videos[next])
     }
 
     // Restore the web remote on launch so a phone/app restart does not break the
@@ -642,6 +953,41 @@ fun MusicPlayerApp() {
         }
         currentIndex = index
         isPlaying = true
+    }
+
+    LaunchedEffect(videoSearchQuery, videoYoutubeMode) {
+        if (videoYoutubeMode && videoSearchQuery.length >= 3) {
+            videoYoutubeResults = emptyList()
+            videoYoutubePage = 1
+            videoYoutubeHasMore = true
+            videoYoutubeLoading = true
+            videoYoutubeLoadingMore = false
+            val found = LibraryRepository.searchYouTube(videoSearchQuery, 1)
+            videoYoutubeResults = found
+            videoYoutubeLoading = false
+            videoYoutubeHasMore = found.isNotEmpty()
+        } else if (!videoYoutubeMode || videoSearchQuery.length < 3) {
+            videoYoutubeResults = emptyList()
+            videoYoutubeLoading = false
+            videoYoutubeHasMore = true
+            videoYoutubePage = 1
+        }
+    }
+
+    val loadMoreVideoYoutube: () -> Unit = {
+        if (videoYoutubeMode && videoSearchQuery.length >= 3 &&
+            !videoYoutubeLoadingMore && videoYoutubeHasMore
+        ) {
+            videoYoutubeLoadingMore = true
+            val nextPage = videoYoutubePage + 1
+            scope.launch {
+                val found = LibraryRepository.searchYouTube(videoSearchQuery, nextPage)
+                videoYoutubeResults = videoYoutubeResults + found
+                videoYoutubePage = nextPage
+                videoYoutubeLoadingMore = false
+                if (found.isEmpty()) videoYoutubeHasMore = false
+            }
+        }
     }
 
     LaunchedEffect(searchQuery, youtubeSearchMode) {
@@ -999,6 +1345,34 @@ fun MusicPlayerApp() {
             radius = 1100f
         )
     )) {
+        // Video: full-screen player (also handles PiP with a bare surface).
+        val activeVideo = fullscreenVideo
+        if (activeVideo != null) {
+            FullscreenVideoPlayer(
+                video = activeVideo,
+                pipMode = pipMode,
+                onClose = { closeVideo() },
+                onCastRequest = {
+                    val index = videos.indexOfFirst { it.id == activeVideo.id }
+                    if (index >= 0) castVideo(index)
+                },
+                castAvailable = castTargets.isNotEmpty(),
+                audioUri = fullscreenVideoAudioUri,
+                videoState = { positionSeconds, durationSeconds, playing ->
+                    videoPositionSeconds = positionSeconds
+                    videoDurationSeconds = durationSeconds
+                    videoPlaying = playing
+                    if (videoIndex < 0) {
+                        videoIndex = videos.indexOfFirst { it.id == activeVideo.id }
+                    }
+                    videoTitle = activeVideo.title
+                },
+                videoCommand = pendingVideoCommand,
+                onVideoCommandConsumed = { pendingVideoCommand = null }
+            )
+            return@Box
+        }
+
         // Concert Mode: full-screen audio-reactive show, nothing else on screen.
         if (concertMode) {
             val concertSong = youtubePlayingSong ?: song ?: songs.firstOrNull()
@@ -1111,7 +1485,7 @@ fun MusicPlayerApp() {
 
             // Tab bar
             Row(modifier = Modifier.fillMaxWidth().height(48.dp).padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                val tabs = listOf(0 to "Full Player", 1 to "Nhạc", 2 to "Share", 3 to "EQ")
+                val tabs = listOf(0 to "Full", 1 to "Nhạc", 2 to "Video", 3 to "Pod", 4 to "Share", 5 to "EQ")
                 tabs.forEach { (tab, label) ->
                     Box(
                         modifier = Modifier
@@ -1207,7 +1581,7 @@ fun MusicPlayerApp() {
             val cubeRotation = remember { Animatable(0f) }
             var dragAccum by remember { mutableFloatStateOf(0f) }
             val tabDensity = LocalDensity.current
-            val tabCount = 4
+            val tabCount = 6
 
             LaunchedEffect(activeTab) {
                 if (displayedTab != activeTab) {
@@ -1244,7 +1618,7 @@ fun MusicPlayerApp() {
                     }
             ) {
                 when (displayedTab) {
-                    3 -> EqualizerView(
+                    5 -> EqualizerView(
                         song = displaySong,
                         bands = eqBands,
                         eqSupported = fx?.eqAvailable == true,
@@ -1267,7 +1641,180 @@ fun MusicPlayerApp() {
                         onTrebGainChange = { trebGain = it }
                     )
 
-                    2 -> ShareHubView(
+                    2 -> {
+                        Column(modifier = Modifier.fillMaxSize()) {
+                            // Search row: local filter, or YouTube when the toggle is on
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                OutlinedTextField(
+                                    value = videoSearchQuery,
+                                    onValueChange = { videoSearchQuery = it },
+                                    placeholder = { Text(if (videoYoutubeMode) "Tìm trên YouTube…" else "Tìm trong thư viện video…", color = Color.White.copy(alpha = 0.4f), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                    singleLine = true,
+                                    shape = RoundedCornerShape(22.dp),
+                                    modifier = Modifier.weight(1f),
+                                    trailingIcon = {
+                                        IconButton(onClick = { videoYoutubeMode = !videoYoutubeMode; videoSearchQuery = ""; videoYoutubeResults = emptyList() }) {
+                                            Icon(
+                                                if (videoYoutubeMode) Icons.Default.Search else Icons.Filled.SmartDisplay,
+                                                contentDescription = "Chuyển giữa thư viện và YouTube",
+                                                tint = if (videoYoutubeMode) Color(0xFFFF0000) else Color(0xFF00F2FE)
+                                            )
+                                        }
+                                    },
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = if (videoYoutubeMode) Color(0xFFFF0000) else Color(0xFF00F2FE),
+                                        unfocusedBorderColor = Color.White.copy(alpha = 0.15f),
+                                        focusedTextColor = Color.White,
+                                        unfocusedTextColor = Color.White,
+                                        cursorColor = Color(0xFF00F2FE)
+                                    )
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            if (videoYoutubeMode) {
+                                when {
+                                    videoSearchQuery.length < 3 -> {
+                                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                            Text("Nhập từ khoá để tìm video trên YouTube", color = Color.White.copy(alpha = 0.5f))
+                                        }
+                                    }
+                                    videoYoutubeLoading && videoYoutubeResults.isEmpty() -> {
+                                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                            CircularProgressIndicator(color = Color(0xFFFF0000))
+                                        }
+                                    }
+                                    videoYoutubeResults.isEmpty() -> {
+                                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                            Text("Không tìm thấy video", color = Color.White.copy(alpha = 0.5f))
+                                        }
+                                    }
+                                    else -> {
+                                        YouTubeResultsView(
+                                            results = videoYoutubeResults,
+                                            isLoading = videoYoutubeLoading,
+                                            isLoadingMore = videoYoutubeLoadingMore,
+                                            hasMore = videoYoutubeHasMore,
+                                            onLoadMore = loadMoreVideoYoutube,
+                                            song = displaySong,
+                                            onPlay = { result ->
+                                                scope.launch {
+                                                    val pair = LibraryRepository.getYouTubeVideoAndAudioUrls(result.videoId)
+                                                    if (pair != null) {
+                                                        openVideo(
+                                                            VideoItem(
+                                                                id = result.videoId.hashCode().toLong(),
+                                                                title = result.title,
+                                                                durationMs = result.duration * 1000L,
+                                                                sizeBytes = 0,
+                                                                width = 16,
+                                                                height = 9,
+                                                                folder = "YouTube",
+                                                                uri = Uri.parse(pair.first),
+                                                                dateAdded = System.currentTimeMillis(),
+                                                                mimeType = "video/mp4"
+                                                            ),
+                                                            audioUri = pair.second?.let { Uri.parse(it) }
+                                                        )
+                                                    } else {
+                                                        Toast.makeText(context, "Không lấy được luồng video", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                }
+                                            },
+                                            onDownload = { result -> downloadQualityPicker = result }
+                                        )
+                                    }
+                                }
+                            } else {
+                            if (videos.isEmpty()) {
+                            Column(
+                                modifier = Modifier.fillMaxSize().padding(32.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                Icon(Icons.Filled.SmartDisplay, contentDescription = null, tint = Color.White.copy(alpha = 0.25f), modifier = Modifier.size(72.dp))
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text(
+                                    if (videosLoading) "Đang quét video…"
+                                    else if (!videoReadGranted) "Cần quyền đọc video"
+                                    else "Chưa thấy video nào",
+                                    color = Color.White.copy(alpha = 0.65f),
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    if (!videoReadGranted)
+                                        "Android 13+ cần quyền READ_MEDIA_VIDEO để đọc phim/clip trong máy."
+                                    else
+                                        "Phim/clip trong thư mục Movies hoặc DCIM sẽ xuất hiện ở đây sau khi quét.",
+                                    color = Color.White.copy(alpha = 0.35f),
+                                    fontSize = 12.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                                Spacer(modifier = Modifier.height(16.dp))
+                                if (!videoReadGranted) {
+                                    Button(onClick = { permissionLauncher.launch(arrayOf(Manifest.permission.READ_MEDIA_VIDEO)) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00F2FE))) {
+                                        Icon(Icons.Filled.SmartDisplay, null, tint = Color.Black)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Bật quyền Video", color = Color.Black, fontWeight = FontWeight.Bold)
+                                    }
+                                } else {
+                                    Button(onClick = { libraryRefreshKey++ }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00F2FE))) {
+                                        Icon(Icons.Filled.Refresh, null, tint = Color.Black)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Quét lại", color = Color.Black, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        } else {
+                            val filtered = if (videoSearchQuery.isBlank()) videos
+                                else videos.filter {
+                                    it.title.contains(videoSearchQuery, ignoreCase = true) ||
+                                        it.folder.contains(videoSearchQuery, ignoreCase = true)
+                                }
+                            if (filtered.isEmpty()) {
+                                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    Text("Không tìm thấy video", color = Color.White.copy(alpha = 0.5f))
+                                }
+                            } else {
+                                LazyVerticalGrid(
+                                    columns = GridCells.Adaptive(158.dp),
+                                    contentPadding = PaddingValues(vertical = 6.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                                    modifier = Modifier.fillMaxSize()
+                                ) {
+                                    items(filtered.size, key = { filtered[it].id }) { i ->
+                                        VideoCard(video = filtered[i], onClick = { openVideo(filtered[i]) })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    }
+                    }
+
+                    3 -> PodcastView(
+                        feeds = podcastFeeds,
+                        loading = podcastLoading,
+                        error = podcastError,
+                        message = podcastMessage,
+                        addingUrl = podcastAddingUrl,
+                        expanded = podcastExpanded,
+                        downloadedGuids = podcastDownloaded,
+                        downloadingGuid = podcastDownloading,
+                        onAddFeed = { addPodcastFeed(it) },
+                        onRemoveFeed = { removePodcastFeed(it) },
+                        onRefreshAll = { refreshPodcasts() },
+                        onToggleExpand = { togglePodcastExpand(it) },
+                        onPlayEpisode = { feed, episode -> playPodcastEpisode(feed, episode) },
+                        onDownloadEpisode = { feed, episode -> downloadPodcastEpisode(feed, episode) }
+                    )
+
+                    4 -> ShareHubView(
                         currentSong = displaySong,
                         localIp = localIp.ifEmpty { null },
                         port = 8080,
@@ -1395,7 +1942,7 @@ fun MusicPlayerApp() {
                                         }
                                     },
                                 onSwipeRightToShare = {},
-                                onSwipeLeftToRemote = { activeTab = 2 }
+                                onSwipeLeftToRemote = { activeTab = 4 }
                             )
                         }
                     }

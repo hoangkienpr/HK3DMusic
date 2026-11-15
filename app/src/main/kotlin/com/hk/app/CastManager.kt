@@ -117,6 +117,27 @@ class CastManager(private val context: Context) {
         watching = false
     }
 
+    /** Cast an arbitrary HTTP stream (e.g. video from our web server) to the connected route. */
+    fun playToCast(url: String, title: String, mimeType: String) {
+        val player = ensurePlayer() ?: return
+        if (!sessionAvailable) return
+        runCatching {
+            val item = androidx.media3.common.MediaItem.Builder()
+                .setUri(url)
+                .setMimeType(mimeType)
+                .setMediaMetadata(
+                    androidx.media3.common.MediaMetadata.Builder()
+                        .setTitle(title)
+                        .setArtist("HK Music Player")
+                        .build()
+                )
+                .build()
+            player.setMediaItem(item)
+            player.prepare()
+            player.play()
+        }.onFailure { lastError = it.message }
+    }
+
     fun connect(device: Device) {
         val player = ensurePlayer()
         if (player == null) {
