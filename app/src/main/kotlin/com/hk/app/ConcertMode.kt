@@ -137,15 +137,17 @@ fun ConcertModeView(
     }
 
     val bins = if (spectrum.isEmpty()) List(48) { 0f } else spectrum
-    val bass = bins.take(6).average().toFloat()
+    val bass = bins.take(8).average().toFloat()
+    val energy = bins.average().toFloat()
     var prevBass by remember { mutableFloatStateOf(0f) }
     var beatAt by remember { mutableLongStateOf(0L) }
-    if (isPlaying && bass - prevBass > 0.16f && System.currentTimeMillis() - beatAt > 320L) {
+    if (isPlaying && bass - prevBass > 0.09f && System.currentTimeMillis() - beatAt > 220L) {
         beatAt = System.currentTimeMillis()
     }
     prevBass = bass
-    val pulse = (1f - (System.currentTimeMillis() - beatAt) / 650f)
-        .coerceIn(0f, 1f).pow(1.7f)
+    val pulse = (1f - (System.currentTimeMillis() - beatAt) / 700f)
+        .coerceIn(0f, 1f).pow(1.6f)
+    val flash = pulse.pow(3f) * 0.14f
 
     val transition = rememberInfiniteTransition(label = "concert")
     val phase by transition.animateFloat(
@@ -214,7 +216,7 @@ fun ConcertModeView(
                 drawCircle(
                     brush = Brush.radialGradient(
                         colors = listOf(
-                            palette[k].copy(alpha = 0.30f + pulse * 0.10f),
+                            palette[k].copy(alpha = 0.16f + energy * 0.30f + pulse * 0.12f),
                             Color.Transparent
                         ),
                         center = Offset(x, y),
@@ -225,7 +227,53 @@ fun ConcertModeView(
                 )
             }
 
-            // --- Expanding beat ring
+            // --- Twinkling starfield (seeded, drifts almost imperceptibly)
+            for (i in 0 until 70) {
+                val seed = i * 127.1f + 311.7f
+                val sx = ((seed * 43758.5453f) % 1000f) / 1000f * size.width
+                val sy = ((seed * 24634.6345f) % 1000f) / 1000f * size.height * 0.55f
+                val twinkle = 0.28f + 0.72f * (0.5f + 0.5f * sin(phase * 1.6f + i * 1.7f))
+                val starR = 0.7f + (((i * 37) % 10) / 10f) * 1.5f
+                drawCircle(
+                    color = Color.White.copy(alpha = twinkle * 0.85f),
+                    radius = starR,
+                    center = Offset(sx, sy)
+                )
+            }
+
+            // --- Sweeping spotlights from the top corners (concert rig)
+            val sweep = sin(phase * 0.7f).toFloat() * 0.55f
+            for (side in 0..1) {
+                val apexX = if (side == 0) size.width * 0.06f else size.width * 0.94f
+                val apex = Offset(apexX, -60f)
+                val dir = if (side == 0) 1f else -1f
+                val tilt = dir * (0.55f + sweep)
+                val beamLen = size.height * 1.15f
+                val spread = 0.34f
+                val tipX = apex.x + sin(tilt) * beamLen
+                val tipY = apex.y + kotlin.math.cos(tilt) * beamLen * 0.82f
+                val leftX = tipX - sin(tilt + spread) * beamLen * 0.42f
+                val rightX = tipX - sin(tilt - spread) * beamLen * 0.42f
+                drawPath(
+                    Path().apply {
+                        moveTo(apex.x, apex.y)
+                        lineTo(leftX, tipY)
+                        lineTo(rightX, tipY)
+                        close()
+                    },
+                    brush = Brush.linearGradient(
+                        colors = listOf(
+                            Color.White.copy(alpha = 0.22f),
+                            palette[side].copy(alpha = 0.10f),
+                            Color.Transparent
+                        ),
+                        start = apex,
+                        end = Offset(tipX, tipY)
+                    )
+                )
+            }
+
+            // --- Expanding beat ring + rotating light rays
             if (pulse > 0.05f) {
                 val ringR = minDim * (0.18f + (1f - pulse) * 0.52f)
                 drawCircle(
@@ -241,6 +289,39 @@ fun ConcertModeView(
                     style = Stroke(width = 2f)
                 )
             }
+            if (pulse > 0.14f) {
+                // 12 volumetric rays from the stage centre, fanning out on big beats.
+                for (k in 0 until 12) {
+                    val angle = k * (PI.toFloat() / 6f) + phase * 0.35f
+                    val inner = minDim * 0.06f
+                    val outer = minDim * (0.30f + pulse * 0.42f)
+                    val dx = cos(angle)
+                    val dy = sin(angle)
+                    drawLine(
+                        color = palette[k % palette.size].copy(alpha = pulse * 0.38f),
+                        start = Offset(cx + dx * inner, cy + dy * inner),
+                        end = Offset(cx + dx * outer, cy + dy * outer),
+                        strokeWidth = 9f + pulse * 26f,
+                        cap = androidx.compose.ui.graphics.StrokeCap.Round
+                    )
+                }
+            }
+            if (pulse > 0.2f) {
+                // Ultra-thin laser lines cutting through the haze on downbeats.
+                val t = phase * 0.5f
+                for (k in 0 until 4) {
+                    val angle = (k * 1.7f + t) % (2f * PI.toFloat())
+                    val len = size.width * 1.3f
+                    val dx = cos(angle)
+                    val dy = sin(angle)
+                    drawLine(
+                        color = palette[(k + 2) % palette.size].copy(alpha = pulse * 0.75f),
+                        start = Offset(cx - dx * len, cy - dy * len),
+                        end = Offset(cx + dx * len, cy + dy * len),
+                        strokeWidth = 1.8f + pulse * 2.4f
+                    )
+                }
+            }
 
             // --- Orbiting particle field
             val particles = 56
@@ -250,19 +331,19 @@ fun ConcertModeView(
                 val dir = if (i % 7 == 0) -1f else 1f
                 val angle = i * golden + phase * (0.28f + (i % 3) * 0.13f) * dir
                 val band = 0.16f + ((i * 37 % 100) / 100f) * 0.46f
-                val radius = minDim * band * (1f + bin * 0.55f + pulse * 0.30f)
+                val radius = minDim * band * (1f + bin * 0.75f + pulse * 0.46f)
                 val x = cx + kotlin.math.cos(angle) * radius
                 val y = cy + kotlin.math.sin(angle) * radius * 0.86f
-                val pSize = 2.2f + bin * 7.5f + if (i % 4 == 0) pulse * 4.5f else pulse * 1.6f
+                val pSize = 2.4f + bin * 9.5f + if (i % 4 == 0) pulse * 6.5f else pulse * 2.4f
                 val color = palette[i % palette.size]
                 drawCircle(
-                    color = color.copy(alpha = 0.28f + bin * 0.6f),
-                    radius = pSize * 2.1f,
+                    color = color.copy(alpha = 0.30f + bin * 0.62f + pulse * 0.2f),
+                    radius = pSize * 2.5f,
                     center = Offset(x, y)
                 )
                 drawCircle(
                     color = Color.White.copy(alpha = 0.65f + bin * 0.35f),
-                    radius = pSize * 0.55f,
+                    radius = pSize * 0.6f,
                     center = Offset(x, y)
                 )
                 if (i % 13 == 0 && pulse > 0.25f) {
@@ -301,6 +382,29 @@ fun ConcertModeView(
                         cubicTo(mx, ys[i], mx, ys[i + 1], (i + 1) * step, ys[i + 1])
                     }
                 }
+                // Back ridge: same data, shorter amplitude, dimmer — gives depth.
+                val back = Path().apply {
+                    moveTo(0f, baseY)
+                    for (i in 0 until n) {
+                        val x = i * step
+                        val y = baseY - smoothed(i).pow(0.9f) * maxH * 0.62f
+                        if (i == 0) moveTo(x, y) else lineTo(x, y)
+                    }
+                    lineTo(size.width, baseY)
+                    close()
+                }
+                drawPath(
+                    back,
+                    brush = Brush.verticalGradient(
+                        colors = listOf(
+                            palette[2].copy(alpha = 0.40f + pulse * 0.12f),
+                            Color.Transparent
+                        ),
+                        startY = baseY - maxH * 0.62f,
+                        endY = baseY
+                    )
+                )
+
                 val mountain = Path().apply {
                     addPath(top)
                     lineTo(size.width, baseY)
@@ -311,8 +415,8 @@ fun ConcertModeView(
                     mountain,
                     brush = Brush.verticalGradient(
                         colors = listOf(
-                            palette[0].copy(alpha = 0.55f + pulse * 0.25f),
-                            palette[1].copy(alpha = 0.10f),
+                            palette[0].copy(alpha = 0.55f + pulse * 0.35f),
+                            palette[1].copy(alpha = 0.16f + pulse * 0.12f),
                             Color.Transparent
                         ),
                         startY = baseY - maxH,
@@ -321,8 +425,21 @@ fun ConcertModeView(
                 )
                 drawPath(
                     top,
-                    brush = Brush.horizontalGradient(listOf(palette[0], palette[1], palette[0])),
-                    style = Stroke(width = 3.2f + pulse * 2.4f)
+                    brush = Brush.horizontalGradient(listOf(palette[0], Color.White, palette[1], palette[0])),
+                    style = Stroke(width = 3.4f + pulse * 5.2f)
+                )
+                // Horizon line with a soft outer halo.
+                drawLine(
+                    color = palette[0].copy(alpha = 0.35f + pulse * 0.25f),
+                    start = Offset(0f, baseY),
+                    end = Offset(size.width, baseY),
+                    strokeWidth = 10f + pulse * 8f
+                )
+                drawLine(
+                    color = Color.White.copy(alpha = 0.75f + pulse * 0.25f),
+                    start = Offset(0f, baseY),
+                    end = Offset(size.width, baseY),
+                    strokeWidth = 2.2f + pulse * 2f
                 )
             }
 
@@ -334,6 +451,21 @@ fun ConcertModeView(
                     radius = minDim * 0.95f
                 )
             )
+
+            // --- Beat flash: a single translucent wash across the stage on big beats
+            if (flash > 0.004f) {
+                drawRect(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            palette[0].copy(alpha = flash),
+                            palette[2].copy(alpha = flash * 0.6f),
+                            Color.Transparent
+                        ),
+                        center = Offset(cx, cy),
+                        radius = minDim * 1.05f
+                    )
+                )
+            }
         }
 
         // --- Overlay UI (auto-hides after a few seconds, tap toggles)
@@ -353,7 +485,7 @@ fun ConcertModeView(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
                             .clip(CircleShape)
-                            .background(Color(0xFFFF0844).copy(alpha = 0.9f))
+                            .background(Color(0xFFFF0844).copy(alpha = 0.65f + pulse * 0.35f))
                             .padding(horizontal = 14.dp, vertical = 6.dp)
                     ) {
                         Box(
@@ -395,7 +527,7 @@ fun ConcertModeView(
                             modifier = Modifier
                                 .size(110.dp)
                                 .clip(CircleShape)
-                                .border(3.dp, palette[0].copy(alpha = 0.9f), CircleShape),
+                                .border((3f + pulse * 3f).dp, palette[0].copy(alpha = 0.55f + pulse * 0.45f), CircleShape),
                             contentScale = ContentScale.Crop
                         )
                         Spacer(Modifier.height(14.dp))
@@ -407,15 +539,29 @@ fun ConcertModeView(
                         fontWeight = FontWeight.Black,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        style = androidx.compose.ui.text.TextStyle(
+                            shadow = androidx.compose.ui.graphics.Shadow(
+                                color = palette[0].copy(alpha = 0.9f),
+                                offset = Offset(0f, 0f),
+                                blurRadius = 26f
+                            )
+                        )
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
                         song.artist,
-                        color = Color.White.copy(alpha = 0.7f),
+                        color = Color.White.copy(alpha = 0.8f),
                         fontSize = 15.sp,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        style = androidx.compose.ui.text.TextStyle(
+                            shadow = androidx.compose.ui.graphics.Shadow(
+                                color = palette[1].copy(alpha = 0.7f),
+                                offset = Offset(0f, 0f),
+                                blurRadius = 16f
+                            )
+                        )
                     )
                     Spacer(Modifier.height(18.dp))
 
