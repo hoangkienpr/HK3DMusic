@@ -65,6 +65,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
@@ -108,6 +109,8 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -284,6 +287,8 @@ fun MusicPlayerApp() {
     var volGain by remember { mutableFloatStateOf(prefs.getFloat("volGain", 0f)) }
     var trebGain by remember { mutableFloatStateOf(prefs.getFloat("trebGain", 0f)) }
     var vizMode by remember { mutableIntStateOf(prefs.getInt("vizMode", 0)) }
+    // Concert Mode: full-screen audio-reactive light show for the current track.
+    var concertMode by remember { mutableStateOf(false) }
     LaunchedEffect(vizMode) { prefs.edit().putInt("vizMode", vizMode).apply() }
     var lyricOffsetMs by remember { mutableIntStateOf(prefs.getInt("lyricOffset", 0)) }
 
@@ -982,6 +987,7 @@ fun MusicPlayerApp() {
         ),
         label = "bgBreath"
     )
+    BackHandler(enabled = concertMode) { concertMode = false }
 
     Box(modifier = Modifier.fillMaxSize().background(
         Brush.radialGradient(
@@ -993,8 +999,28 @@ fun MusicPlayerApp() {
             radius = 1100f
         )
     )) {
-        // Picture-in-Picture: render ONLY the compact player surface — no tabs, no mini bar, no controls.
-        if (pipMode) {
+        // Concert Mode: full-screen audio-reactive show, nothing else on screen.
+        if (concertMode) {
+            val concertSong = youtubePlayingSong ?: song ?: songs.firstOrNull()
+            if (concertSong != null) {
+                ConcertModeView(
+                    song = concertSong,
+                    spectrum = audioLevels.spectrum,
+                    isPlaying = isPlaying,
+                    recordAudioGranted = recordAudioGranted,
+                    positionSeconds = positionSeconds,
+                    totalSeconds = totalSeconds,
+                    onTogglePlay = { activeTogglePlayback() },
+                    onNext = { if (songs.isNotEmpty()) { currentIndex = (currentIndex + 1) % songs.size; isPlaying = true } },
+                    onPrev = { if (songs.isNotEmpty()) { currentIndex = (currentIndex - 1 + songs.size) % songs.size; isPlaying = true } },
+                    onRequestMic = { permissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO)) },
+                    onClose = { concertMode = false }
+                )
+            } else {
+                Box(modifier = Modifier.fillMaxSize().background(Color.Black))
+            }
+            return@Box
+        } else if (pipMode) {
             val pipSong = youtubePlayingSong ?: song ?: songs.firstOrNull()
             Box(
                 modifier = Modifier.fillMaxSize().background(Color.Black),
@@ -1376,7 +1402,55 @@ fun MusicPlayerApp() {
                     }
 
                     0 -> {
-                        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+                        Box(modifier = Modifier.fillMaxSize().background(Color(0xFF05070F))) {
+                            // Ambient glow: the artwork itself, blown up and heavily blurred.
+                            // Everything below (lyrics, covers, controls) sits on top of it.
+                            val art = displaySong.albumArtBitmap
+                            if (art != null) {
+                                Image(
+                                    bitmap = art,
+                                    contentDescription = null,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .blur(72.dp)
+                                        .alpha(0.45f + bgBreath * 1.2f),
+                                    contentScale = ContentScale.Crop
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier.fillMaxSize().background(
+                                        Brush.radialGradient(
+                                            colors = listOf(
+                                                displaySong.color1.copy(alpha = 0.55f + bgBreath),
+                                                displaySong.color2.copy(alpha = 0.35f),
+                                                Color(0xFF05070F)
+                                            ),
+                                            radius = 1200f
+                                        )
+                                    )
+                                )
+                            }
+                            // Legibility scrims: darker towards the edges, darkest at the bottom.
+                            Box(
+                                modifier = Modifier.fillMaxSize().background(
+                                    Brush.radialGradient(
+                                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.62f)),
+                                        radius = 820f
+                                    )
+                                )
+                            )
+                            Box(
+                                modifier = Modifier.fillMaxSize().background(
+                                    Brush.verticalGradient(
+                                        colors = listOf(
+                                            Color.Black.copy(alpha = 0.05f),
+                                            Color.Black.copy(alpha = 0.18f),
+                                            Color.Black.copy(alpha = 0.45f),
+                                            Color.Black.copy(alpha = 0.85f)
+                                        )
+                                    )
+                                )
+                            )
                             Column(modifier = Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.SpaceBetween, horizontalAlignment = Alignment.CenterHorizontally) {
                                 if (showLyrics) {
                                     KaraokeLyricsView(
@@ -1494,6 +1568,20 @@ fun MusicPlayerApp() {
                                         },
                                         modifier = Modifier.size(44.dp)
                                     ) { Icon(Icons.Filled.PictureInPictureAlt, contentDescription = "PiP", tint = Color.White.copy(alpha = 0.6f)) }
+                                    IconButton(
+                                        onClick = {
+                                            if (recordAudioGranted) {
+                                                concertMode = true
+                                            } else {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Bật quyền micro để dùng Concert Mode",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            }
+                                        },
+                                        modifier = Modifier.size(44.dp)
+                                    ) { Icon(Icons.Filled.AutoAwesome, contentDescription = "Concert Mode", tint = Color(0xFFFFD479)) }
                                     // Local mute only — never silences the TV/web outputs, just the phone speaker
                                     IconButton(
                                         onClick = {

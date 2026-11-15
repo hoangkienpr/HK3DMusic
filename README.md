@@ -12,6 +12,8 @@ qua Wi-Fi và phát lên Chromecast / DLNA TV.
 | Phát nhạc | `ExoPlayer` chạy trong `MusicService` (`MediaSessionService`): phát nền, thông báo media, khoá màn hình, tai nghe/Bluetooth, tua, next/prev, shuffle, repeat |
 | Âm thanh | `Equalizer` (đúng số băng tần của thiết bị) + 3 núm vặn BASS / VOL / TREB, preset (Bass/Normal/Treble/Vocal/Rock/Pop) |
 | Visualizer | `Visualizer` thật lấy dữ liệu từ audio session (cần quyền `RECORD_AUDIO`), **5 kiểu** — Bars / Wave / Radial / Mirror / Constellation, chạm thanh để đổi, lưu lựa chọn |
+| Concert Mode | Chế độ light show toàn màn hình: particle orbit, aurora glow theo artwork, spectrum mountain 48 band, beat detection (vòng tỏa khi bass drop), UI tự ẩn, nút LIVE/✕, vào từ Full Player ✨ |
+| Ambient glow | Ảnh bìa phóng to + blur toàn màn hình Full Player, alpha "thở" theo nhịp, scrim gradient giữ chữ dễ đọc |
 | Tìm kiếm / YouTube | Tìm video YouTube trong app, phát trực tiếp hoặc tải về nghe offline, chọn chất lượng tải |
 | Lời bài hát | LRCLIB + file `.lrc` cùng tên + offset ±0,5 s, đồng bộ theo thời gian |
 | Web remote | HTTP server thật (mặc định cổng 8080): trang điều khiển cho PC/điện thoại cùng Wi-Fi, playlist, tua, volume, EQ web, phím tắt, upload nhạc, chia sẻ playlist qua QR |
