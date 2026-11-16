@@ -832,28 +832,8 @@ fun SongList3DWithGestures(
                         }
                     }
 
-                    var dragTotal by remember(song.id) { mutableStateOf(0f) }
                     Box(
-                        modifier = Modifier
-                            .pointerInput(song.id) {
-                                detectHorizontalDragGestures(
-                                    onDragStart = { dragTotal = 0f },
-                                    onDragEnd = { dragTotal = 0f },
-                                    onDragCancel = { dragTotal = 0f },
-                                    onHorizontalDrag = { change, dragAmount ->
-                                        change.consume()
-                                        dragTotal += dragAmount
-                                        if (dragTotal > 120f) {
-                                            dragTotal = 0f
-                                            onSwipeRightToShare(song)
-                                        } else if (dragTotal < -120f) {
-                                            dragTotal = 0f
-                                            onSwipeLeftToRemote()
-                                        }
-                                    }
-                                )
-                            }
-                            .clickable(onClick = { onSongSelected(song) })
+                        modifier = Modifier.clickable(onClick = { onSongSelected(song) })
                     ) {
                         SongItem3D(
                             song = song,

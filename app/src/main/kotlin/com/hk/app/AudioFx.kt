@@ -6,13 +6,14 @@ import android.media.audiofx.Virtualizer
 import android.media.audiofx.Visualizer
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import java.util.Locale
 import kotlin.math.max
@@ -120,11 +121,9 @@ class AudioFxEngine(sessionId: Int) {
     }
 }
 
-/** How many times attach is retried while waiting for the first buffer.
- * The Visualizer can only deliver once the audio sink actually opens (i.e.
- * when playback starts), so a short cap here kills the visualizer for the
- * whole pinned-session lifetime when the app sits paused at startup. */
-private const val MAX_VISUALIZER_ATTEMPTS = 400
+/** While audio is playing, tolerate this much silence before re-arming the
+ * native effect. Paused playback never triggers a retry. */
+private const val VISUALIZER_SILENT_MS = 4_000L
 
 /** One frame of real audio data: time domain plus frequency bins. */
 data class AudioLevels(
@@ -137,54 +136,50 @@ data class AudioLevels(
  * the waveform (for bar/circle styles) and the FFT spectrum (for the column and
  * particle styles).
  *
- * Android requires the RECORD_AUDIO permission for this API since Android 9.
- * When the effect cannot be created the values stay flat instead of showing
- * fabricated animation.
+ * Android only delivers buffers once the audio sink is actually open, and a
+ * handed-over session can stay silent for a while after a track change, a
+ * buffering stall or a pause. Re-creating the effect for every retry (the old
+ * behaviour) released and re-attached the native effect in a tight loop, which
+ * made the graph flicker, drop to flat and sometimes never recover.
  *
- * The session can be handed over before the player has actually opened its
- * audio sink (streamed tracks, YouTube, right after a track change). In that
- * case attaching fails or never delivers a buffer, so every attempt is guarded
- * by a watchdog that re-creates the effect a few times. The caller keeps
- * polling the real session id, and a changed id restarts this effect with a
- * fresh attempt counter.
+ * This version keeps one instance alive for the whole session:
+ *  - while paused it never touches the effect, so playback resumes instantly;
+ *  - a single watchdog re-arms the live instance first, and only re-creates it
+ *    with a growing back-off when the sink really looks lost;
+ *  - the last frame stays on screen while re-attaching instead of blanking.
  */
 @Composable
 fun rememberAudioLevels(
     sessionId: Int,
     enabled: Boolean,
+    isPlaying: Boolean = true,
     bars: Int = 20
 ): AudioLevels {
     var levels by remember {
         mutableStateOf(AudioLevels(List(bars) { 0f }, List(bars) { 0f }))
     }
-    // Auto-gain for the spectrum: the hottest bin drives the normalization
-    // (instant attack, ~15% decay per frame), so every column moves instead
-    // of only a few mid-range bins.
-    var spectrumGain by remember { mutableFloatStateOf(0.25f) }
-    val handler = remember { Handler(Looper.getMainLooper()) }
-    // Restarts the effect when an attach attempt has to be repeated.
-    var attempt by remember(sessionId, enabled) { mutableIntStateOf(0) }
+    val playing = rememberUpdatedState(isPlaying)
 
-    DisposableEffect(sessionId, enabled, bars, attempt) {
-        if (sessionId <= 0 || !enabled) {
-            handler.post { levels = AudioLevels(List(bars) { 0f }, List(bars) { 0f }) }
+    DisposableEffect(sessionId, enabled, bars, isPlaying) {
+        // Only attach once playback is actually running. On several devices an
+        // effect created before the audio sink opens stays on the session but
+        // never receives a buffer, and it then blocks later re-attachments.
+        if (sessionId <= 0 || !enabled || !isPlaying) {
             return@DisposableEffect onDispose { }
         }
 
+        // One handler per attachment: disposing cancels every pending watchdog
+        // and post without touching other compositions.
+        val handler = Handler(Looper.getMainLooper())
         var disposed = false
-        var delivered = false
-        var watchdog: Runnable? = null
-
-        fun retryLater(delayMs: Long = -1L) {
-            if (disposed || delivered || attempt >= MAX_VISUALIZER_ATTEMPTS) return
-            val effectiveDelay = if (delayMs > 0L) delayMs
-                else (300L + attempt * 150L).coerceAtMost(1500L)
-            val action = Runnable {
-                if (!disposed && !delivered) attempt++
-            }
-            watchdog = action
-            handler.postDelayed(action, effectiveDelay)
-        }
+        var hasData = false
+        var lastDataAt = 0L
+        var failures = 0
+        var visualizer: Visualizer? = null
+        // Per-attachment auto-gain for the spectrum: the hottest bin drives the
+        // normalization (instant attack, ~15% decay per frame), so every column
+        // moves instead of only a few mid-range bins.
+        var gain = 0.25f
 
         fun waveformOf(waveform: ByteArray): List<Float> {
             val chunk = max(1, waveform.size / bars)
@@ -227,79 +222,135 @@ fun rememberAudioLevels(
                 // sqrt compresses the dynamic range so quiet highs stay visible.
                 computed.add(sqrt(peak).coerceIn(0f, 1f))
             }
-            // Normalize against the running peak bin (fast attack, slow release):
-            // the whole row dances instead of a couple of mid-range columns.
+            // Normalize against the running peak bin (fast attack, slow release).
             val bandPeak = computed.maxOrNull() ?: 0f
-            val next = max(bandPeak, spectrumGain * 0.85f).coerceIn(0.05f, 1f)
-            spectrumGain = next
+            val next = max(bandPeak, gain * 0.85f).coerceIn(0.05f, 1f)
+            gain = next
             return computed.map { (it / next).coerceIn(0f, 1f) }
         }
 
-        val visualizer = runCatching { Visualizer(sessionId) }.onFailure {
-            android.util.Log.w("AudioFx", "Visualizer ctor failed for session=$sessionId (attempt=$attempt)", it)
-        }.getOrNull()
-        val attachOk = visualizer != null && runCatching {
-            val captureRange = Visualizer.getCaptureSizeRange()
-            android.util.Log.i("AudioFx", "captureRange=[${captureRange.getOrNull(0)}, ${captureRange.getOrNull(1)}] maxCaptureRate=${Visualizer.getMaxCaptureRate()} session=$sessionId")
-            visualizer.captureSize = captureRange[0].coerceAtLeast(128)
-            android.util.Log.i("AudioFx", "Visualizer captureSize=${visualizer.captureSize} session=$sessionId")
-            visualizer.setDataCaptureListener(
-                object : Visualizer.OnDataCaptureListener {
-                    override fun onWaveFormDataCapture(
-                        visualizer: Visualizer?,
-                        waveform: ByteArray?,
-                        samplingRate: Int
-                    ) {
-                        if (waveform == null || waveform.isEmpty()) return
-                        if (!delivered) {
-                            android.util.Log.i("AudioFx", "Visualizer first waveform buffer delivered (session=$sessionId)")
-                        }
-                        delivered = true
-                        val computed = waveformOf(waveform)
-                        handler.post { levels = levels.copy(waveform = computed) }
-                    }
+        val listener = object : Visualizer.OnDataCaptureListener {
+            var waveformFrames = 0
+            var fftFrames = 0
 
-                    override fun onFftDataCapture(
-                        visualizer: Visualizer?,
-                        fft: ByteArray?,
-                        samplingRate: Int
-                    ) {
-                        if (fft == null || fft.size < 4) return
-                        delivered = true
-                        val computed = spectrumOf(fft)
-                        handler.post { levels = levels.copy(spectrum = computed) }
-                    }
-                },
-                max(1, Visualizer.getMaxCaptureRate() / 2),
-                true,
-                true
-            )
-            visualizer.enabled = true
-        }.onFailure { e ->
-            android.util.Log.w("AudioFx", "Visualizer configure/attach threw (session=$sessionId attempt=$attempt)", e)
-        }.isSuccess
+            override fun onWaveFormDataCapture(
+                visualizer: Visualizer?,
+                waveform: ByteArray?,
+                samplingRate: Int
+            ) {
+                if (waveform == null || waveform.isEmpty()) return
+                if (!hasData) Log.i("AudioFx", "first waveform buffer size=${waveform.size} rate=$samplingRate")
+                hasData = true
+                failures = 0
+                lastDataAt = SystemClock.elapsedRealtime()
+                val computed = waveformOf(waveform)
+                if (++waveformFrames % 600 == 0) {
+                    Log.i("AudioFx", "waveform frames=$waveformFrames peak=${computed.maxOrNull()}")
+                }
+                handler.post { if (!disposed) levels = levels.copy(waveform = computed) }
+            }
 
-        if (!attachOk) {
-            android.util.Log.w("AudioFx", "Visualizer attach failed for session=$sessionId (attempt=$attempt)")
-            runCatching { visualizer?.enabled = false }
-            runCatching { visualizer?.release() }
-            handler.post { levels = AudioLevels(List(bars) { 0f }, List(bars) { 0f }) }
-            retryLater()
-            return@DisposableEffect onDispose {
-                disposed = true
-                watchdog?.let { handler.removeCallbacks(it) }
+            override fun onFftDataCapture(
+                visualizer: Visualizer?,
+                fft: ByteArray?,
+                samplingRate: Int
+            ) {
+                if (fft == null || fft.size < 4) return
+                if (!hasData) Log.i("AudioFx", "first fft buffer size=${fft.size} rate=$samplingRate")
+                hasData = true
+                failures = 0
+                lastDataAt = SystemClock.elapsedRealtime()
+                val computed = spectrumOf(fft)
+                if (++fftFrames % 600 == 0) {
+                    Log.i("AudioFx", "fft frames=$fftFrames peak=${computed.maxOrNull()}")
+                }
+                handler.post { if (!disposed) levels = levels.copy(spectrum = computed) }
             }
         }
 
-        // Attached, but no buffer yet: the sink may still be warming up.
-        retryLater(delayMs = 1_500L)
+        fun releaseVisualizer() {
+            val current = visualizer ?: return
+            visualizer = null
+            runCatching { current.enabled = false }
+            runCatching { current.release() }
+        }
+
+        fun attachVisualizer(): Boolean {
+            releaseVisualizer()
+            val created = runCatching { Visualizer(sessionId) }.getOrNull() ?: run {
+                Log.w("AudioFx", "Visualizer() failed for session=$sessionId")
+                return false
+            }
+            fun configure() {
+                val range = Visualizer.getCaptureSizeRange()
+                created.captureSize = (range.getOrNull(0) ?: 128).coerceAtLeast(128)
+                created.setDataCaptureListener(
+                    listener,
+                    max(1, Visualizer.getMaxCaptureRate() / 2),
+                    true,
+                    true
+                )
+                created.enabled = true
+            }
+            var error = runCatching { configure() }.exceptionOrNull()
+            if (error != null) {
+                // A stale effect from an earlier attach can still be ENABLED on
+                // this session, which makes setCaptureSize() throw. Disable it
+                // and try once more before giving up on this cycle.
+                runCatching { created.enabled = false }
+                error = runCatching { configure() }.exceptionOrNull()
+            }
+            if (error != null) {
+                Log.w("AudioFx", "Visualizer attach failed for session=$sessionId", error)
+                runCatching { created.release() }
+                return false
+            }
+            Log.i("AudioFx", "Visualizer attached session=$sessionId capture=${created.captureSize} rate=${Visualizer.getMaxCaptureRate()}")
+            visualizer = created
+            return true
+        }
+
+        // Single watchdog: checks liveness and repairs the attachment. It used
+        // to be a DisposableEffect key, which tore the effect down every retry.
+        fun watchdog() {
+            if (disposed) return
+            var delay = 3_000L
+            val now = SystemClock.elapsedRealtime()
+            val silent = !hasData || now - lastDataAt > VISUALIZER_SILENT_MS
+
+            if (!playing.value) {
+                // Paused/stopped: no buffers are expected, so leave the effect
+                // untouched. Playback (or a new track) resumes it instantly.
+                delay = 3_000L
+            } else if (silent) {
+                hasData = false
+                failures++
+                Log.w("AudioFx", "visualizer silent while playing (failures=$failures visualizer=${visualizer != null})")
+                if (visualizer != null && failures % 3 != 0) {
+                    // Cheap re-arm on the live instance first.
+                    runCatching { visualizer?.enabled = false }
+                    runCatching { visualizer?.enabled = true }
+                    delay = 1_500L
+                } else {
+                    // Re-create with a growing back-off so we never spin the
+                    // audio effect while the sink is still opening.
+                    attachVisualizer()
+                    delay = (2_000L + failures * 750L).coerceAtMost(8_000L)
+                }
+            }
+
+            handler.postDelayed({ watchdog() }, delay)
+        }
+
+        // Give the player a moment to open the audio sink, then attach. The
+        // watchdog repairs it if the sink was still warming up.
+        handler.postDelayed({ attachVisualizer() }, 500L)
+        handler.postDelayed({ watchdog() }, 500L + VISUALIZER_SILENT_MS)
 
         onDispose {
             disposed = true
-            watchdog?.let { handler.removeCallbacks(it) }
-            runCatching { visualizer?.enabled = false }
-            runCatching { visualizer?.release() }
-            handler.post { levels = AudioLevels(List(bars) { 0f }, List(bars) { 0f }) }
+            handler.removeCallbacksAndMessages(null)
+            releaseVisualizer()
         }
     }
 

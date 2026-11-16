@@ -9,57 +9,95 @@ import java.util.Locale
 object VideoRepository {
 
     fun scan(context: Context): List<VideoItem> {
-        val projection = arrayOf(
-            MediaStore.Video.Media._ID,
-            MediaStore.Video.Media.TITLE,
-            MediaStore.Video.Media.DURATION,
-            MediaStore.Video.Media.SIZE,
-            MediaStore.Video.Media.WIDTH,
-            MediaStore.Video.Media.HEIGHT,
-            MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
-            MediaStore.Video.Media.DATE_ADDED,
-            MediaStore.Video.Media.MIME_TYPE
+        val projections = listOf(
+            arrayOf(
+                MediaStore.Video.Media._ID,
+                MediaStore.Video.Media.TITLE,
+                MediaStore.Video.Media.DURATION,
+                MediaStore.Video.Media.SIZE,
+                MediaStore.Video.Media.WIDTH,
+                MediaStore.Video.Media.HEIGHT,
+                MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
+                MediaStore.Video.Media.DATE_ADDED,
+                MediaStore.Video.Media.MIME_TYPE
+            ),
+            arrayOf(
+                MediaStore.Video.Media._ID,
+                MediaStore.Video.Media.TITLE,
+                MediaStore.Video.Media.DURATION,
+                MediaStore.Video.Media.SIZE,
+                MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
+                MediaStore.Video.Media.DATE_ADDED,
+                MediaStore.Video.Media.MIME_TYPE
+            ),
+            arrayOf(
+                MediaStore.Video.Media._ID,
+                MediaStore.Video.Media.TITLE,
+                MediaStore.Video.Media.DURATION
+            ),
+            arrayOf(MediaStore.Video.Media._ID)
         )
         val items = mutableListOf<VideoItem>()
-        runCatching {
-            context.contentResolver.query(
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                null,
-                null,
+        var scanned = false
+        for (projection in projections) {
+            if (scanned) break
+            val sort = if (projection.contains(MediaStore.Video.Media.DATE_ADDED)) {
                 "${MediaStore.Video.Media.DATE_ADDED} DESC"
-            )?.use { cursor ->
-                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
-                val titleCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.TITLE)
-                val durCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
-                val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
-                val wCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH)
-                val hCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT)
-                val folderCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.BUCKET_DISPLAY_NAME)
-                val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
-                val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.MIME_TYPE)
+            } else {
+                "${MediaStore.Video.Media._ID} DESC"
+            }
+            runCatching {
+                context.contentResolver.query(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    projection,
+                    null,
+                    null,
+                    sort
+                )?.use { cursor ->
+                // Use getColumnIndex (not OrThrow) so a single missing column
+                // on a particular device does not discard the whole list.
+                val idCol = cursor.getColumnIndex(MediaStore.Video.Media._ID)
+                val titleCol = cursor.getColumnIndex(MediaStore.Video.Media.TITLE)
+                val durCol = cursor.getColumnIndex(MediaStore.Video.Media.DURATION)
+                val sizeCol = cursor.getColumnIndex(MediaStore.Video.Media.SIZE)
+                val wCol = cursor.getColumnIndex(MediaStore.Video.Media.WIDTH)
+                val hCol = cursor.getColumnIndex(MediaStore.Video.Media.HEIGHT)
+                val folderCol = cursor.getColumnIndex(MediaStore.Video.Media.BUCKET_DISPLAY_NAME)
+                val dateCol = cursor.getColumnIndex(MediaStore.Video.Media.DATE_ADDED)
+                val mimeCol = cursor.getColumnIndex(MediaStore.Video.Media.MIME_TYPE)
+
+                if (idCol < 0) return@use
+                android.util.Log.e("VideoRepository", "projection=${projection.size} cursorCount=${cursor.count} idCol=$idCol")
 
                 while (cursor.moveToNext()) {
-                    val id = cursor.getLong(idCol)
-                    val uri = Uri.withAppendedPath(
-                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                        id.toString()
-                    )
-                    items += VideoItem(
-                        id = id,
-                        title = cursor.getString(titleCol)?.ifBlank { "Video $id" } ?: "Video $id",
-                        durationMs = cursor.getLong(durCol),
-                        sizeBytes = cursor.getLong(sizeCol),
-                        width = cursor.getInt(wCol),
-                        height = cursor.getInt(hCol),
-                        folder = cursor.getString(folderCol) ?: "Movies",
-                        uri = uri,
-                        dateAdded = cursor.getLong(dateCol),
-                        mimeType = cursor.getString(mimeCol) ?: "video/mp4"
-                    )
+                    runCatching {
+                        val id = cursor.getLong(idCol)
+                        val uri = Uri.withAppendedPath(
+                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                            id.toString()
+                        )
+                        items += VideoItem(
+                            id = id,
+                            title = if (titleCol >= 0) cursor.getString(titleCol)?.ifBlank { "Video $id" } ?: "Video $id" else "Video $id",
+                            durationMs = if (durCol >= 0) cursor.getLong(durCol) else 0L,
+                            sizeBytes = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L,
+                            width = if (wCol >= 0) cursor.getInt(wCol) else 0,
+                            height = if (hCol >= 0) cursor.getInt(hCol) else 0,
+                            folder = if (folderCol >= 0) cursor.getString(folderCol) ?: "Movies" else "Movies",
+                            uri = uri,
+                            dateAdded = if (dateCol >= 0) cursor.getLong(dateCol) else 0L,
+                            mimeType = if (mimeCol >= 0) cursor.getString(mimeCol) ?: "video/mp4" else "video/mp4"
+                        )
+                    }
                 }
+                scanned = true
             }
+        }.onFailure { e ->
+            android.util.Log.e("VideoRepository", "scan failed", e)
         }
+        if (scanned) break
+        }
+        android.util.Log.e("VideoRepository", "scan returned ${items.size} videos")
         return items
     }
 

@@ -492,47 +492,68 @@ object LibraryRepository {
 
             val results = mutableListOf<YouTubeResult>()
             JsonReader(conn.inputStream.bufferedReader()).use { reader ->
+                reader.isLenient = true
                 reader.beginArray()
                 while (reader.hasNext()) {
-                    var videoId = ""
-                    var title = ""
-                    var author = ""
-                    var duration = 0
-                    var thumbUrl = ""
-                    reader.beginObject()
-                    while (reader.hasNext()) {
-                        when (reader.nextName()) {
-                            "videoId" -> videoId = reader.nextString()
-                            "title" -> title = reader.nextString()
-                            "author" -> author = reader.nextString()
-                            "lengthSeconds" -> duration = reader.nextInt()
-                            "videoThumbnails" -> {
-                                reader.beginArray()
-                                if (reader.hasNext()) {
-                                    reader.beginObject()
-                                    while (reader.hasNext()) {
-                                        if (reader.nextName() == "url") {
-                                            thumbUrl = reader.nextString()
-                                        } else {
-                                            reader.skipValue()
-                                        }
-                                    }
-                                    reader.endObject()
+                    runCatching {
+                        var videoId = ""
+                        var title = ""
+                        var author = ""
+                        var duration = 0
+                        var thumbUrl = ""
+                        var type = ""
+                        reader.beginObject()
+                        while (reader.hasNext()) {
+                            when (reader.nextName()) {
+                                "videoId" -> videoId = if (reader.peek() == android.util.JsonToken.NULL) { reader.nextNull(); "" } else reader.nextString()
+                                "title" -> title = if (reader.peek() == android.util.JsonToken.NULL) { reader.nextNull(); "" } else reader.nextString()
+                                "author" -> author = if (reader.peek() == android.util.JsonToken.NULL) { reader.nextNull(); "" } else reader.nextString()
+                                "type" -> type = if (reader.peek() == android.util.JsonToken.NULL) { reader.nextNull(); "" } else reader.nextString()
+                                "lengthSeconds" -> duration = when (reader.peek()) {
+                                    android.util.JsonToken.NULL -> { reader.nextNull(); 0 }
+                                    android.util.JsonToken.NUMBER -> try { reader.nextInt() } catch (_: Exception) { reader.nextDouble().toInt() }
+                                    android.util.JsonToken.STRING -> reader.nextString().toIntOrNull() ?: 0
+                                    else -> { reader.skipValue(); 0 }
                                 }
-                                while (reader.hasNext()) reader.skipValue()
-                                reader.endArray()
+                                "videoThumbnails" -> {
+                                    if (reader.peek() == android.util.JsonToken.NULL) {
+                                        reader.nextNull()
+                                    } else {
+                                        reader.beginArray()
+                                        if (reader.hasNext()) {
+                                            if (reader.peek() == android.util.JsonToken.BEGIN_OBJECT) {
+                                                reader.beginObject()
+                                                while (reader.hasNext()) {
+                                                    if (reader.nextName() == "url") {
+                                                        thumbUrl = if (reader.peek() == android.util.JsonToken.NULL) { reader.nextNull(); thumbUrl } else reader.nextString()
+                                                    } else {
+                                                        reader.skipValue()
+                                                    }
+                                                }
+                                                reader.endObject()
+                                            } else {
+                                                reader.skipValue()
+                                            }
+                                        }
+                                        while (reader.hasNext()) reader.skipValue()
+                                        reader.endArray()
+                                    }
+                                }
+                                else -> reader.skipValue()
                             }
-                            else -> reader.skipValue()
                         }
+                        reader.endObject()
+                        if (type.isNotBlank() && type != "video") return@runCatching
+                        if (videoId.isBlank()) return@runCatching
+                        if (thumbUrl.isBlank()) {
+                            thumbUrl = "https://i.ytimg.com/vi/$videoId/mqdefault.jpg"
+                        }
+                        val r = YouTubeResult(videoId, title, author, duration, thumbUrl)
+                        results.add(r)
+                        onResult?.invoke(r)
+                    }.onFailure {
+                        runCatching { reader.skipValue() }
                     }
-                    reader.endObject()
-                    if (videoId.isBlank()) continue
-                    if (thumbUrl.isBlank()) {
-                        thumbUrl = "https://i.ytimg.com/vi/$videoId/mqdefault.jpg"
-                    }
-                    val r = YouTubeResult(videoId, title, author, duration, thumbUrl)
-                    results.add(r)
-                    onResult?.invoke(r)
                 }
                 reader.endArray()
             }
@@ -615,8 +636,8 @@ object LibraryRepository {
             if (fallback == null || h < fallback!!.second || (h == fallback!!.second && avc > fallback!!.third)) {
                 fallback = Triple(streamUrl, h, avc)
             }
-            // Default cap to 480p for adaptive to reduce stalling, unless user asked higher
-            val cap = if (pref == null) minOf(maxH, 480) else maxH
+            // Default cap for adaptive (separated) streams to reduce stalling, unless user asked higher
+            val cap = if (pref == null) minOf(maxH, 720) else maxH
             if (h <= cap) {
                 if (best == null || h > best!!.second || (h == best!!.second && avc > best!!.third)) {
                     best = Triple(streamUrl, h, avc)

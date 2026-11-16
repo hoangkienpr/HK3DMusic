@@ -104,21 +104,30 @@ class DlnaManager(private val context: Context? = null) {
             val locations = LinkedHashSet<String>()
             runCatching {
                 DatagramSocket().use { socket ->
-                    socket.soTimeout = 400
+                    socket.soTimeout = 500
                     socket.broadcast = true
-                    val payload = ssdpRequest().toByteArray(Charsets.US_ASCII)
+                    socket.reuseAddress = true
                     val multicast = InetAddress.getByName("239.255.255.250")
-                    // Some TVs ignore the first M-SEARCH (radio just woke up), so
-                    // keep re-sending while we listen and stay open long enough
-                    // for a slow renderer to answer.
-                    val deadline = System.currentTimeMillis() + 4000
-                    val buffer = ByteArray(4096)
+                    val targets = listOf(
+                        "urn:schemas-upnp-org:device:MediaRenderer:1",
+                        "urn:schemas-upnp-org:service:AVTransport:1",
+                        "ssdp:all",
+                        "upnp:rootdevice"
+                    )
+                    val deadline = System.currentTimeMillis() + 6500
+                    val buffer = ByteArray(8192)
+                    var burst = 0
                     while (System.currentTimeMillis() < deadline) {
-                        runCatching {
-                            socket.send(DatagramPacket(payload, payload.size, multicast, 1900))
+                        val st = targets[burst % targets.size]
+                        val payload = ssdpRequest(st).toByteArray(Charsets.US_ASCII)
+                        // Send a small burst for the current target; some renderers
+                        // drop the first packet or only answer a specific ST.
+                        repeat(2) {
+                            runCatching {
+                                socket.send(DatagramPacket(payload, payload.size, multicast, 1900))
+                            }
                         }
-                        // Listen for ~700ms after each search.
-                        val listenUntil = System.currentTimeMillis() + 700
+                        val listenUntil = minOf(System.currentTimeMillis() + 800, deadline)
                         while (System.currentTimeMillis() < listenUntil) {
                             val packet = DatagramPacket(buffer, buffer.size)
                             try {
@@ -133,6 +142,7 @@ class DlnaManager(private val context: Context? = null) {
                                 ?.trim()
                             if (!location.isNullOrEmpty()) locations.add(location)
                         }
+                        burst++
                     }
                 }
             }.onFailure { lastError = it.message }
@@ -158,11 +168,11 @@ class DlnaManager(private val context: Context? = null) {
         }, "dlna-ssdp").apply { isDaemon = true }.start()
     }
 
-    private fun ssdpRequest(): String = "M-SEARCH * HTTP/1.1\r\n" +
+    private fun ssdpRequest(st: String = "urn:schemas-upnp-org:device:MediaRenderer:1"): String = "M-SEARCH * HTTP/1.1\r\n" +
         "HOST: 239.255.255.250:1900\r\n" +
         "MAN: \"ssdp:discover\"\r\n" +
-        "MX: 2\r\n" +
-        "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
+        "MX: 3\r\n" +
+        "ST: $st\r\n\r\n"
 
     private fun fetchDescription(location: String): Device? = runCatching {
         parseDeviceDescription(httpGet(location), location)

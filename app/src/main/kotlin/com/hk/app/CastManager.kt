@@ -9,6 +9,7 @@ import androidx.media3.cast.SessionAvailabilityListener
 import androidx.mediarouter.media.MediaControlIntent
 import androidx.mediarouter.media.MediaRouteSelector
 import androidx.mediarouter.media.MediaRouter
+import com.google.android.gms.cast.CastMediaControlIntent
 import com.google.android.gms.cast.framework.CastContext
 
 /**
@@ -76,8 +77,13 @@ class CastManager(private val context: Context) {
             val ctx = CastContext.getSharedInstance(context)
             castContext = ctx
             android.util.Log.d("CastManager", "CastContext initialized, receiver app id: ${ctx.castOptions?.receiverApplicationId}")
-            // Use a broader selector that includes all cast devices
+            val receiverId = ctx.castOptions?.receiverApplicationId
+                ?: CastMediaControlIntent.DEFAULT_MEDIA_RECEIVER_APPLICATION_ID
+            // Match the configured Cast receiver explicitly, plus broad remote
+            // playback categories so non-default receivers/routes still appear.
             selector = MediaRouteSelector.Builder()
+                .addControlCategory(CastMediaControlIntent.categoryForCast(receiverId))
+                .addControlCategory(CastMediaControlIntent.categoryForCast(CastMediaControlIntent.DEFAULT_MEDIA_RECEIVER_APPLICATION_ID))
                 .addControlCategory(MediaControlIntent.CATEGORY_LIVE_AUDIO)
                 .addControlCategory(MediaControlIntent.CATEGORY_LIVE_VIDEO)
                 .addControlCategory(MediaControlIntent.CATEGORY_REMOTE_PLAYBACK)

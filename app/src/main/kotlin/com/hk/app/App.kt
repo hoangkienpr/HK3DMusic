@@ -180,6 +180,16 @@ fun MusicPlayerApp() {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             needed.add(Manifest.permission.RECORD_AUDIO)
         }
+        // Discovery (Chromecast/mDNS, DLNA/SSDP) often needs location and, on
+        // Android 13+, the nearby Wi-Fi devices permission.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+        }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             needed.add(Manifest.permission.ACCESS_COARSE_LOCATION)
         }
@@ -207,6 +217,7 @@ fun MusicPlayerApp() {
     var videoPlayIndexRequest by remember { mutableStateOf<Int?>(null) }
     var videoUrlPlayRequest by remember { mutableStateOf<Triple<String, String, String?>?>(null) }
     var videoNavRequest by remember { mutableStateOf<String?>(null) }
+    var videoStopRequest by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(libraryRefreshKey, videoReadGranted) {
         libraryLoading = true
@@ -313,7 +324,12 @@ fun MusicPlayerApp() {
     }
 
     val recordAudioGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-    val audioLevels = rememberAudioLevels(audioSessionId.intValue, enabled = recordAudioGranted, bars = 20)
+    val audioLevels = rememberAudioLevels(
+        audioSessionId.intValue,
+        enabled = recordAudioGranted,
+        isPlaying = isPlaying,
+        bars = 20
+    )
     val prefs = remember { context.getSharedPreferences("nexus_settings", Context.MODE_PRIVATE) }
     var bassBoostEnabled by remember { mutableStateOf(prefs.getBoolean("bassBoost", false)) }
     var virtualizerEnabled by remember { mutableStateOf(prefs.getBoolean("virtualizer", false)) }
@@ -485,6 +501,7 @@ fun MusicPlayerApp() {
     var castConnectRequest by remember { mutableStateOf<CastTarget?>(null) }
     var castPlayIndexRequest by remember { mutableStateOf<Int?>(null) }
     var castPlayVideoRequest by remember { mutableStateOf<Int?>(null) }
+    var castPlayUrlRequest by remember { mutableStateOf<Pair<String, String>?>(null) }
     // Device id the web asked for before it showed up in the discovered list.
     var pendingCastConnectId by remember { mutableStateOf<String?>(null) }
     // Track of the exact song we already handed to the TV. Re-running the push
@@ -609,6 +626,23 @@ fun MusicPlayerApp() {
                         }
                     }
 
+                    is RemoteCommand.MoveQueue -> {
+                        val from = command.from
+                        val to = command.to
+                        if (from in songs.indices && to in songs.indices && from != to) {
+                            val moved = songs[from]
+                            val updated = songs.toMutableList()
+                            updated.removeAt(from)
+                            updated.add(to.coerceIn(0, updated.size), moved)
+                            songs = updated
+                            currentIndex = when {
+                                from == currentIndex -> to
+                                from < currentIndex && to >= currentIndex -> currentIndex - 1
+                                from > currentIndex && to <= currentIndex -> currentIndex + 1
+                                else -> currentIndex
+                            }
+                        }
+                    }
                     is RemoteCommand.PlaySelection -> { val picked = command.indices.distinct().firstOrNull { it in songs.indices }; if (picked != null) { currentIndex = picked; isPlaying = true } }
                     is RemoteCommand.QueueNext -> {
                         val toAdd = command.indices.distinct().mapNotNull { songs.getOrNull(it) }
@@ -657,6 +691,9 @@ fun MusicPlayerApp() {
                             pendingVideoCommand = "toggle"
                         }
                     }
+                    RemoteCommand.VideoStop -> {
+                        videoStopRequest++
+                    }
                     is RemoteCommand.VideoSeek -> {
                         if (fullscreenVideo != null && pendingVideoCommand == null) {
                             pendingVideoCommand = "seek:${command.seconds}"
@@ -683,6 +720,9 @@ fun MusicPlayerApp() {
                     }
                     is RemoteCommand.CastPlayVideo -> {
                         castPlayVideoRequest = command.index
+                    }
+                    is RemoteCommand.CastPlayUrl -> {
+                        castPlayUrlRequest = command.url to command.title
                     }
                     }
                 }
@@ -857,10 +897,41 @@ fun MusicPlayerApp() {
         }
     }
 
+    fun castVideoUrl(url: String, title: String) {
+        when {
+            dlnaManager.isCasting -> {
+                dlnaManager.playTrack(
+                    trackId = "url:${url.hashCode()}",
+                    url = url,
+                    title = title.ifBlank { "Video" },
+                    artist = "YouTube",
+                    album = "Stream",
+                    artworkUrl = null
+                )
+            }
+            castManager.isCasting -> {
+                castManager.playToCast(url, title.ifBlank { "Video" }, "video/mp4")
+            }
+            else -> {
+                Toast.makeText(
+                    context,
+                    "Chưa kết nối TV — vào tab Share → Cast TV để kết nối",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
     LaunchedEffect(castPlayVideoRequest) {
         val index = castPlayVideoRequest ?: return@LaunchedEffect
         castPlayVideoRequest = null
         castVideo(index)
+    }
+
+    LaunchedEffect(castPlayUrlRequest) {
+        val req = castPlayUrlRequest ?: return@LaunchedEffect
+        castPlayUrlRequest = null
+        castVideoUrl(req.first, req.second)
     }
 
     var fullscreenVideoAudioUri by remember { mutableStateOf<Uri?>(null) }
@@ -888,6 +959,11 @@ fun MusicPlayerApp() {
         videoDurationSeconds = 0
         videoIndex = -1
         MainActivity.autoEnterPip = false
+    }
+
+    // Web remote: "stop video" request (e.g. when the user switches to the music tab).
+    LaunchedEffect(videoStopRequest) {
+        if (videoStopRequest > 0) closeVideo()
     }
 
     LaunchedEffect(videoPlayIndexRequest) {
