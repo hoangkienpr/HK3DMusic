@@ -12,8 +12,8 @@ android {
         applicationId = "com.hk.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 145
-        versionName = "1.144"
+        versionCode = 147
+        versionName = "1.146"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     testOptions {
